@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg-link
+
+# Build artifacts
+build/
+dist/
+*.whl
+*.tar.gz
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# pytest
+.pytest_cache/
+
+# Isolated development worktrees
+.worktrees/
+
+# Editor and OS files
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# uv lock (project uses no runtime deps)
+uv.lock
+
+# Coverage
+.coverage
+htmlcov/
+
+# Local development docs (not for public repo)
+docs/internal-dev/

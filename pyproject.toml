@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "termrecall"
+version = "0.1.0"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY.md", "LICENSES/*"]
+readme = "README.md"
+dependencies = []
+
+[project.scripts]
+termrecall = "termrecall.cli:main"
+termrecall-bridge = "termrecall.bridge:bridge_main"
+termrecall-nonblock = "termrecall.bridge:nonblock_helper_main"
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<9", "pytest-asyncio>=0.24,<1"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["desktop: requires a real supported graphical desktop"]
+
+[tool.setuptools.package-data]
+termrecall = ["data/bash/*.bash", "data/xdg/*.desktop", "libexec/termrecall-nonblock"]

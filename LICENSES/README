@@ -1,0 +1,6 @@
+TermRecall currently vendors no third-party source or assets.
+
+The project license is GPL-3.0-or-later; its complete text is in ../LICENSE.
+Third-party development-tool notices are in ../THIRD_PARTY.md.
+
+Future vendored material must add its exact license text to this directory and a corresponding provenance entry to THIRD_PARTY.md.

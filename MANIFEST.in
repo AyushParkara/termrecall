@@ -1,0 +1,4 @@
+include native/termrecall-nonblock.c
+include installer_probe.py
+include install.sh
+include cleanup_private_tree.py

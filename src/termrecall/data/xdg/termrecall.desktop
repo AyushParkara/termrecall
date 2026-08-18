@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TermRecall
+Exec={executable} login-coordinator
+OnlyShowIn=X-Cinnamon;Cinnamon;
+X-GNOME-Autostart-enabled=true
+Terminal=false
+NoDisplay=true
