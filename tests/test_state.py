@@ -206,28 +206,47 @@ def test_reregistration_is_complete_authoritative_current_state(
     shell = state.snapshot.shells[0]
     assert shell.identity == new_identity
     assert shell.cwd == "/tmp"
-    assert shell.last_sequence == 0
+    # Reconnect preserves the event watermark so already-accepted events
+    # cannot be replayed (finding #11).
+    assert shell.last_sequence == 1
+    assert state.registrations[shell.shell_id].last_sequence == 1
+    assert state.registrations[shell.shell_id].last_command_sequence == 4
     assert shell.command is None
     assert shell.termination is None
     registration = state.registrations[shell.shell_id]
     assert registration.identity == new_identity
-    assert registration.last_command_sequence == 0
     assert state.dirty_generation == 3
 
+    # After the reconnect, a re-sent stale event (sequence 1, command
+    # sequence 4) must be rejected as a duplicate: the watermark survived the
+    # reconnect (finding #11).
+    stale = event(
+        Operation.COMMAND_STARTED,
+        capability="d" * 43,
+        identity=new_identity,
+        sequence=1,
+        command_sequence=4,
+        command="sleep 10",
+    )
+    with pytest.raises(ValueError, match="sequence"):
+        apply_event(state, stale)
+
+    # A fresh event with a higher sequence advances normally.
     state = apply_event(
         state,
         event(
             Operation.COMMAND_STARTED,
             capability="d" * 43,
             identity=new_identity,
-            sequence=1,
-            command_sequence=4,
+            sequence=2,
+            command_sequence=5,
             command="sleep 10",
         ),
     )
     assert state.snapshot.shells[0].command is not None
-    assert state.snapshot.shells[0].command.sequence == 4
-    assert state.registrations[shell.shell_id].last_command_sequence == 4
+    assert state.snapshot.shells[0].command.sequence == 5
+    assert state.registrations[shell.shell_id].last_sequence == 2
+    assert state.registrations[shell.shell_id].last_command_sequence == 5
 
 
 def test_command_finish_atomically_clears_replay_before_status(
@@ -537,9 +556,13 @@ def test_explicit_exit_is_terminal_for_registration_without_mutation(
     assert exited.dirty_generation == 2
 
 
-def test_reregistration_resets_explicit_exit_finality(
+def test_reregistration_preserves_sequence_and_clears_explicit_exit(
     empty_state: EngineState, register_request: RegisterRequest
 ) -> None:
+    # A genuine reconnect (same identity) clears an explicit-exit termination
+    # so a recovered shell can resume, but it must NOT reset the event/command
+    # sequence watermarks (finding #11): a replayed duplicate event must still
+    # be rejected.
     exited = apply_event(
         registered(empty_state, register_request),
         event(Operation.EXPLICIT_EXIT, sequence=1),
@@ -553,7 +576,14 @@ def test_reregistration_resets_explicit_exit_finality(
     assert new_capability == "n" * 43
     assert current.snapshot.shells[0].termination is None
     assert current.snapshot.shells[0].cwd == "/new"
-    assert current.registrations[register_request.shell_id].last_sequence == 0
+    assert current.snapshot.shells[0].last_sequence == 1
+    assert current.registrations[register_request.shell_id].last_sequence == 1
+    # A duplicate of the already-accepted event must still be rejected after
+    # the reconnect, using the fresh capability.
+    duplicate = event(Operation.EXPLICIT_EXIT, sequence=1)
+    duplicate = replace(duplicate, capability=new_capability)
+    with pytest.raises(ValueError, match="sequence"):
+        apply_event(current, duplicate)
 
 
 def test_unknown_shell_is_rejected_without_mutation(empty_state: EngineState) -> None:

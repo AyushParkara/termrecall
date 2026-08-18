@@ -241,6 +241,7 @@ ServiceRequest: TypeAlias = (
 @dataclass(frozen=True, slots=True)
 class RegisterResponse:
     capability: str
+    resume_sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,7 +651,7 @@ def _object_list(value: object, name: str, reader: Callable[[object], Any]) -> t
 def _decode_response_payload(p: dict[str, object]) -> ServiceResponse:
     _schema(p); ok = _boolean(p.get("ok"), "ok"); response = _string(p.get("response"), "response", MAX_ID_CHARS, empty=False)
     common = {"schema_version", "ok", "response"}
-    if response == "register" and ok: _exact(p, common | {"capability"}, response); return RegisterResponse(_capability(p["capability"]))
+    if response == "register" and ok: _exact(p, common | {"capability", "resume_sequence"}, response); return RegisterResponse(_capability(p["capability"]), _integer(p["resume_sequence"], "resume_sequence", 0))
     if response == "event" and ok: _exact(p, common | {"sequence"}, response); return EventResponse(_integer(p["sequence"], "sequence", 1))
     if response == "status" and ok:
         keys = {"ready", "registered_shells", "dirty_generation", "durable_generation", "write_active", "durability_degraded", "last_error", "recovery_item_count", "diagnostics"}; _exact(p, common | keys, response)
@@ -712,7 +713,7 @@ def _outcome_dict(item: OutcomeView) -> dict[str, object]:
 
 def _response_to_dict(response: ServiceResponse) -> dict[str, object]:
     p: dict[str, object] = {"schema_version": 1, "ok": True}
-    if isinstance(response, RegisterResponse): p.update(response="register", capability=response.capability)
+    if isinstance(response, RegisterResponse): p.update(response="register", capability=response.capability, resume_sequence=response.resume_sequence)
     elif isinstance(response, EventResponse): p.update(response="event", sequence=response.sequence)
     elif isinstance(response, StatusResponse):
         if response.last_error is not None and not isinstance(response.last_error, SafeExternalText): raise ValueError("last_error lacks safe external provenance")

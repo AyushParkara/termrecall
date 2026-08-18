@@ -82,23 +82,50 @@ def register_shell(
     if peer_pid is not None and request.identity.pid != peer_pid:
         raise ValueError("identity does not match peer")
 
+    # A re-registration of an existing shell_id is a reconnect (the peer_pid
+    # check above already verifies the submitting process's real PID, so a
+    # process cannot lie about its identity).  Rather than replacing the
+    # registration wholesale, RECONCILE it: preserve the event/command
+    # sequence watermarks so duplicate events replayed after the reconnect are
+    # still rejected (finding #11).  A fresh capability is issued and any prior
+    # explicit-exit termination is cleared so a recovered shell can resume.
+    existing_registration = state.registrations.get(request.shell_id)
+    existing_shell = None
+    for candidate in state.snapshot.shells:
+        if candidate.shell_id == request.shell_id:
+            existing_shell = candidate
+            break
+    if existing_registration is not None:
+        preserved_sequence = existing_shell.last_sequence if existing_shell else existing_registration.last_sequence
+    else:
+        preserved_sequence = request.sequence
+    # Construct the ShellRecord (which validates shell_id/cwd) BEFORE minting a
+    # capability so an invalid request is rejected without side effects.
     shell = ShellRecord(
         request.shell_id,
         request.identity,
         request.adapter,
         request.cwd,
-        request.sequence,
+        preserved_sequence,
         None,
         None,
     )
     capability = capability_factory()
-    registration = Registration(capability, request.identity, request.sequence, 0)
     if any(
         existing.capability == capability
         for shell_id, existing in state.registrations.items()
         if shell_id != request.shell_id
     ):
         raise ValueError("capability collision")
+    if existing_registration is not None:
+        registration = Registration(
+            capability,
+            request.identity,
+            existing_registration.last_sequence,
+            existing_registration.last_command_sequence,
+        )
+    else:
+        registration = Registration(capability, request.identity, request.sequence, 0)
     shells = _replace_or_append_shell(state.snapshot.shells, shell)
     registrations = dict(state.registrations)
     registrations[request.shell_id] = registration

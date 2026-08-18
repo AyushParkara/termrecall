@@ -314,20 +314,33 @@ class SnapshotStore:
         create_parents: bool,
         root_boundary: Path | None,
     ) -> int:
-        absolute = path.absolute()
+        # ``Path.absolute()`` does NOT normalize ``..`` components, so a path
+        # like ``/root/../victim/state`` would otherwise survive
+        # ``relative_to`` and escape the declared ``root_boundary``.  We must
+        # collapse ``..`` lexically WITHOUT following symlinks (the descriptor-
+        # relative ``O_NOFOLLOW`` traversal below deliberately rejects symlinks
+        # in the ancestry), so use ``os.path.normpath`` rather than
+        # ``Path.resolve`` (which follows symlinks and would bypass that
+        # protection).  ``..`` components that escape the filesystem root are
+        # clamped by normpath; the boundary check then rejects the remainder.
+        absolute = Path(os.path.normpath(str(path.absolute())))
         name = absolute.name
         if not name or name in (".", ".."):
             raise UnsafeStatePath("state directory must have a final component")
         if create_parents and root_boundary is None:
             raise UnsafeStatePath("state parent creation requires a root boundary")
 
-        boundary = (root_boundary or Path(absolute.anchor)).absolute()
+        boundary = Path(os.path.normpath(str((root_boundary or Path(absolute.anchor)).absolute())))
+        if ".." in absolute.relative_to(Path(absolute.anchor)).parts:
+            raise UnsafeStatePath("state directory escapes filesystem root")
         try:
             relative = absolute.relative_to(boundary)
         except ValueError as exc:
             raise UnsafeStatePath("state directory is outside root boundary") from exc
         if not relative.parts:
             raise UnsafeStatePath("state directory must be below root boundary")
+        if ".." in relative.parts:
+            raise UnsafeStatePath("state directory escapes root boundary")
 
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:

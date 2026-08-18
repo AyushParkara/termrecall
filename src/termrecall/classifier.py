@@ -4,6 +4,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import NamedTuple
 
 from termrecall.model import MAX_COMMAND_CHARS, CommandDisposition, CommandRecord
 
@@ -140,6 +141,39 @@ _SHELL_RESERVED_WORDS = {
     "local",
 }
 
+# Commands that mutate filesystem, package, cron, or remote state and so
+# cannot be safely auto-replayed even when no embedded interpreter is present.
+_STATE_CHANGING = {
+    "touch", "mkdir", "rmdir", "cp", "mv", "install", "chmod", "chown",
+    "chgrp", "ln", "link", "rename", "unlink", "truncate", "tee", "dd",
+    "mkfifo", "mknod", "mount", "umount", "swapoff", "swapon",
+    "pip", "pip3", "pipx", "poetry", "uv", "conda", "mamba",
+    "npm", "npx", "yarn", "pnpm", "bun", "deno",
+    "cargo", "rustup", "go", "gem", "bundle", "composer",
+    "crontab", "at", "batch",
+    "curl", "wget", "ftp", "scp", "rsync", "s3cmd", "aws", "gcloud", "kubectl",
+    "systemctl", "service", "initctl", "update-rc.d", "chkconfig",
+    "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel",
+    "passwd", "chpasswd", "chage",
+    "docker", "podman", "nerdctl",
+}
+# Interpreters that execute an attacker-supplied script file or inline code
+# and therefore cannot be auto-replayed as a single safe argv unless they take
+# the module form ``name -m module`` (no local file execution).
+_SCRIPT_INTERPRETERS = {
+    "python", "python3",
+    "ruby", "rb",
+    "node",
+    "perl",
+    "php",
+    "lua",
+    "tclsh", "wish", "tcl",
+    "groovy", "gosh", "jrunscript",
+    "rscript", "R",
+    "julia",
+    "awk", "gawk", "mawk", "nawk",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class Classification:
@@ -149,6 +183,36 @@ class Classification:
 
 class _PolicyRejection(ValueError):
     pass
+
+
+class ParsedCommand(NamedTuple):
+    """Canonical representation of a single, validated simple command.
+
+    ``executable`` is the program name (last path component, lower-cased) after
+    skipping any ``VAR=value`` prefix assignments.  ``argv`` is the literal
+    token list (including any prefix assignments) and ``prefix`` is the number
+    of leading environment-assignment tokens.  Both the classifier and the
+    recovery layer consume this single representation so they cannot disagree
+    about what the executable is.
+    """
+
+    executable: str
+    argv: tuple[str, ...]
+    prefix: int
+
+
+# A leading ``VAR=value`` token is an environment assignment to Bash, not an
+# executable argument.  Replay must not honour captured environment mutations,
+# so any such prefix causes rejection.
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+# Bash parameter / variable expansions are expanded by the shell at replay
+# time and can splice arbitrary arguments or state (positional params ``$@``,
+# PID ``$$``, exit status ``$?``, ``${@}``, ``${0}``, named ``$VAR``, etc.),
+# so any such construct is rejected even when quoted.
+_PARAM_EXPANSION_RE = re.compile(r"\$\{[^}]*\}|\$[@#0-9!?$*\-]|\$[A-Za-z_][A-Za-z0-9_]*")
+# Glob / pathname-expansion metacharacters let directory contents change the
+# executed program after classification, so they are rejected.
+_GLOB_CHARS = ("*", "?", "[")
 
 
 def classify_command(command: str, sequence: int) -> Classification:
@@ -172,7 +236,7 @@ def classify_command(command: str, sequence: int) -> Classification:
             return _redacted(sequence)
 
     try:
-        tokens = _parse_one_simple_command(command, normalized_tokens)
+        parsed = _parse_one_simple_command(command, normalized_tokens)
     except _PolicyRejection:
         return Classification(
             CommandRecord(
@@ -185,7 +249,8 @@ def classify_command(command: str, sequence: int) -> Classification:
             "command cannot be represented as one simple command",
         )
 
-    executable = _command_name(tokens)
+    executable = parsed.executable
+    tokens = list(parsed.argv)
     if _is_unsafe(executable) or executable in _SHELL_STATEFUL:
         return Classification(
             CommandRecord(
@@ -218,6 +283,28 @@ def classify_command(command: str, sequence: int) -> Classification:
                 True,
             ),
             "shell reserved word",
+        )
+    if executable in _STATE_CHANGING:
+        return Classification(
+            CommandRecord(
+                sequence,
+                _bounded_display(command),
+                None,
+                CommandDisposition.UNSAFE,
+                True,
+            ),
+            "state-changing command",
+        )
+    if executable in _SCRIPT_INTERPRETERS and _interpreter_runs_script(executable, parsed):
+        return Classification(
+            CommandRecord(
+                sequence,
+                _bounded_display(command),
+                None,
+                CommandDisposition.UNSAFE,
+                True,
+            ),
+            "interpreter executes a script file",
         )
     if _requires_unavailable_interactive_state(executable, tokens):
         return Classification(
@@ -315,8 +402,18 @@ def _contains_fragmented_credential(command: str) -> bool:
 
 def _parse_one_simple_command(
     command: str, normalized_tokens: list[str] | None = None
-) -> list[str]:
+) -> ParsedCommand:
     if not command.strip() or "\x00" in command or command.endswith("\\"):
+        raise _PolicyRejection
+
+    # Reject glob metacharacters and parameter expansions anywhere in the
+    # command text.  Quoting does not make these safe: a quoted ``$VAR`` is
+    # still expanded by Bash at replay time, and a quoted ``*`` is still a
+    # literal token but ``shlex`` cannot distinguish it from an unquoted glob
+    # reliably, so we refuse both forms for replayable commands.
+    if any(ch in command for ch in _GLOB_CHARS):
+        raise _PolicyRejection
+    if _PARAM_EXPANSION_RE.search(command):
         raise _PolicyRejection
 
     quote: str | None = None
@@ -371,10 +468,32 @@ def _parse_one_simple_command(
         tokens = normalized_tokens
     if not tokens:
         raise _PolicyRejection
-    return tokens
+
+    # Leading ``VAR=value`` tokens are environment-assignment prefixes in
+    # Bash.  Replay must not honour captured environment mutations (they can
+    # load attacker libraries via LD_PRELOAD, alter interpreter search paths
+    # via PYTHONPATH, etc.), so any such prefix makes the command
+    # unrepresentable rather than replayable.
+    prefix = 0
+    while prefix < len(tokens) and _ENV_ASSIGNMENT_RE.fullmatch(tokens[prefix]):
+        prefix += 1
+    if prefix >= len(tokens):
+        raise _PolicyRejection
+    if prefix > 0:
+        # One or more environment assignments precede the executable.  Replay
+        # would reconstruct those mutations, which is unsafe, so refuse.
+        raise _PolicyRejection
+
+    executable_name = PurePosixPath(tokens[prefix]).name.lower()
+    return ParsedCommand(executable_name, tuple(tokens), prefix)
 
 
 def _command_name(tokens: list[str]) -> str:
+    """Backward-compatible executable name from raw token list.
+
+    Used by the recovery layer to resolve the executable past ``VAR=value``
+    prefixes.  Prefer ``ParsedCommand`` for new code.
+    """
     index = 0
     while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
         index += 1
@@ -402,6 +521,51 @@ def _requires_unavailable_interactive_state(executable: str, tokens: list[str]) 
         if arguments[0] == "-m":
             return len(arguments) < 2
     return arguments[0].startswith("-")
+
+
+# Inline-code / interactive flags for script interpreters.  When the first
+# argument is one of these the interpreter runs attacker-supplied code.
+_INTERPRETER_CODE_FLAGS = {
+    "-c", "-e", "-r", "-p", "-y", "--eval", "-i", "-Q",
+}
+# Module-form flags that do NOT execute a local script file.  ``python -m
+# http.server`` imports a stdlib module by name and is safe to replay.
+_INTERPRETER_MODULE_FLAGS = {"-m", "--module"}
+
+
+def _interpreter_runs_script(executable: str, parsed: ParsedCommand) -> bool:
+    """Return True when an interpreter invocation runs a script file or inline code.
+
+    ``python -m http.server`` and ``python --version`` are safe; everything
+    else (``python file.py``, ``python -c '...'``, ``ruby file.rb``) executes
+    attacker-controlled code and is rejected.
+    """
+    arguments = parsed.argv[parsed.prefix + 1:]
+    if not arguments:
+        # A bare interpreter with no arguments starts a REPL/interactive shell,
+        # which cannot be replayed.
+        return True
+    first = arguments[0]
+    if executable in {"python", "python3"}:
+        if first in _INTERPRETER_MODULE_FLAGS:
+            # ``-m module`` form: no local file execution; allow it.
+            return len(arguments) < 2
+        if first in _INTERPRETER_CODE_FLAGS:
+            return True
+        # A non-option first argument is a script filename -> reject.
+        return not first.startswith("-")
+    # For all other script interpreters (ruby/node/perl/php/lua/groovy/...)
+    # any non-option argument is a script file and any -c/-e style flag is
+    # inline code.  Scan the WHOLE argument list (not just the first token) so
+    # that ``groovy -X /tmp/payload.groovy`` or ``node --print code`` is still
+    # rejected: a script/code argument anywhere means attacker code runs.
+    if any(arg in _INTERPRETER_CODE_FLAGS for arg in arguments):
+        return True
+    # Any non-option (positional) argument is treated as a script file.
+    if any(not arg.startswith("-") for arg in arguments):
+        return True
+    # Only purely-option invocations (e.g. ``--version``) are allowed.
+    return False
 
 
 def _bounded_display(command: str) -> str:

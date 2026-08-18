@@ -698,7 +698,7 @@ async def test_register_and_every_lifecycle_event_return_exact_typed_responses(s
     response, raw, _ = await dispatch(server, register_wire())
     capability = response.pop("capability")
     assert len(capability) >= 32
-    assert response == {"schema_version": 1, "ok": True, "response": "register"}
+    assert response == {"schema_version": 1, "ok": True, "response": "register", "resume_sequence": 0}
     assert server.checkpoints.marked == [1]
 
     events = [
@@ -742,6 +742,32 @@ async def test_register_accepts_matching_peer_pid(server_factory) -> None:
     assert response["ok"] is True
     assert response["response"] == "register"
     assert set(server.state.registrations) == {SHELL_ID}
+
+
+@pytest.mark.asyncio
+async def test_reconnect_returns_resume_sequence_and_rejects_stale_events(
+    server_factory,
+) -> None:
+    # Findings #10/#11: a reconnect must report the persisted sequence watermark
+    # via resume_sequence and must reject stale duplicate events.
+    server = server_factory()
+    response, _, _ = await dispatch(server, register_wire())
+    capability = response["capability"]
+    assert response["resume_sequence"] == 0
+    # Accept one event (sequence 1).
+    response, _, _ = await dispatch(
+        server, event_wire("prompt_ready", capability, 1, cwd="/srv/app")
+    )
+    assert response["sequence"] == 1
+    # Reconnect the same shell id; the server must report resume_sequence=1.
+    response, _, _ = await dispatch(server, register_wire())
+    new_capability = response["capability"]
+    assert response["resume_sequence"] == 1
+    # A stale duplicate of event 1 must be rejected.
+    stale, _, _ = await dispatch(
+        server, event_wire("prompt_ready", new_capability, 1, cwd="/srv/app")
+    )
+    assert stale["ok"] is False
 
 
 @pytest.mark.asyncio

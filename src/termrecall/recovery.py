@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
 import shutil
 import stat
 from collections.abc import Callable, Set as AbstractSet, Sequence
@@ -15,7 +14,7 @@ from pathlib import Path
 
 from termrecall.adapters.base import LaunchAction, LaunchItem, TerminalAdapter
 from termrecall.adapters.registry import SUPPORTED_ADAPTERS
-from termrecall.classifier import _command_name
+from termrecall.classifier import _parse_one_simple_command
 from termrecall.model import (
     CommandDisposition,
     RecoveryItemRecord,
@@ -286,17 +285,23 @@ def build_attempt(
             and command.disposition is CommandDisposition.REPLAYABLE
             and command.executable is not None
         ):
+            # Use the same canonical ParsedCommand representation the
+            # classifier produces so classification and recovery agree on what
+            # the executable is (finding: the two layers previously had
+            # different models, e.g. ``PATH=/tmp /bin/ls`` resolved the prefix
+            # as the command name).
             try:
-                tokens = shlex.split(command.executable)
+                parsed = _parse_one_simple_command(command.executable)
             except ValueError:
-                tokens = []
-            # Resolve the executable past any VAR=value prefixes instead of
-            # treating the prefix itself as the command name.
-            name = _command_name(tokens)
-            if name and executable_resolver(name) is not None:
-                approved_command = command.executable
-            else:
+                parsed = None
+            if (
+                parsed is None
+                or not parsed.executable
+                or executable_resolver(parsed.executable) is None
+            ):
                 missing_executable.add(item_id)
+            else:
+                approved_command = command.executable
         directory, _ = resolve_directory(Path(stored.shell.cwd), home or Path.home())
         launches.append(LaunchItem(item_id, directory, approved_command))
 

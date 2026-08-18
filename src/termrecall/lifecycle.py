@@ -438,9 +438,25 @@ def staged_self_check(
     venv_bin = generation / "venv" / "bin"
     if not venv_bin.is_dir():
         raise LifecycleError(LifecycleExit.REFUSED, "staged venv missing")
+    # Validate every staged executable with the same rigour as the marker above:
+    # ``Path.exists()`` follows symlinks, so a symlinked ``termrecall`` pointing
+    # at an attacker-controlled executable would pass.  Use ``os.lstat`` and
+    # require a regular file, owned by the service UID, mode 0o755, and not a
+    # symlink.
     for name in ("termrecall", "termrecall-bridge", "termrecall-nonblock"):
-        if not (venv_bin / name).exists():
-            raise LifecycleError(LifecycleExit.REFUSED, "staged executable missing")
+        exe_path = venv_bin / name
+        try:
+            exe_st = os.lstat(exe_path)
+        except FileNotFoundError:
+            raise LifecycleError(LifecycleExit.REFUSED, "staged executable missing") from None
+        if stat.S_ISLNK(exe_st.st_mode):
+            raise LifecycleError(LifecycleExit.REFUSED, "staged executable is a symlink")
+        if not stat.S_ISREG(exe_st.st_mode):
+            raise LifecycleError(LifecycleExit.REFUSED, "staged executable not a regular file")
+        if exe_st.st_uid != uid:
+            raise LifecycleError(LifecycleExit.REFUSED, "staged executable owner mismatch")
+        if stat.S_IMODE(exe_st.st_mode) != 0o755:
+            raise LifecycleError(LifecycleExit.REFUSED, "staged executable mode unsafe")
 
 
 def _structural_remove_dir(root: Path, uid: int) -> None:

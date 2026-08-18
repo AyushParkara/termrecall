@@ -430,7 +430,10 @@ class TermRecallServer:
                 return _error(ErrorCode.INVALID_REQUEST)
             await self.checkpoints.mark_dirty(updated.dirty_generation)
             self.state = updated
-            return RegisterResponse(capability)
+            # Tell the bridge where to resume from so a reconnect cannot replay
+            # already-accepted events (finding #11).
+            resume_sequence = updated.registrations[request.shell_id].last_sequence
+            return RegisterResponse(capability, resume_sequence)
 
         if isinstance(request, EventRequest):
             try:

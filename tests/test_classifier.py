@@ -185,11 +185,13 @@ def test_destructive_and_stateful_interactive_commands_are_rejected(command: str
         "ruby worker.rb",
     ],
 )
-def test_interpreters_with_noninteractive_script_shape_are_replayable(command: str) -> None:
+def test_interpreters_running_script_files_are_not_replayable(command: str) -> None:
+    # Interpreters that consume a script file execute attacker-controlled code
+    # and must never be auto-replayed.
     result = classify_command(command, 1)
 
-    assert result.record.disposition is CommandDisposition.REPLAYABLE
-    assert result.record.executable == command
+    assert result.record.disposition is CommandDisposition.UNSAFE
+    assert result.record.executable is None
 
 
 @pytest.mark.parametrize(
@@ -237,8 +239,6 @@ def test_overlength_simple_command_is_nonreplayable_instead_of_raising() -> None
     [
         "env sudo apt update",
         "command rm -rf /",
-        "FOO=bar sudo apt update",
-        "FOO=bar",
         "cd /tmp",
         "export NAME=value",
         "source ./activate",
@@ -248,6 +248,25 @@ def test_wrapped_unsafe_and_shell_state_commands_are_not_replayable(command: str
     result = classify_command(command, 1)
 
     assert result.record.disposition is CommandDisposition.UNSAFE
+    assert result.record.executable is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "FOO=bar sudo apt update",
+        "FOO=bar",
+        "LD_PRELOAD=/tmp/x.so /bin/true",
+        "PYTHONPATH=/tmp python3 /tmp/payload.py",
+        "PATH=/tmp /bin/ls",
+    ],
+)
+def test_environment_assignment_prefixes_are_not_replayable(command: str) -> None:
+    # Environment-assignment prefixes are unsafe to replay (LD_PRELOAD,
+    # PYTHONPATH, ...), so the classifier refuses to represent them.
+    result = classify_command(command, 1)
+
+    assert result.record.disposition is CommandDisposition.UNREPRESENTABLE
     assert result.record.executable is None
 
 
@@ -321,10 +340,12 @@ def test_any_nonempty_authorization_value_is_redacted(command: str) -> None:
     ],
 )
 def test_empty_authorization_header_is_not_marked_sensitive(command: str) -> None:
+    # curl is state-changing (network side effects) and therefore UNSAFE, but
+    # an empty Authorization header must still not be mis-handled as REDACTED.
     result = classify_command(command, 12)
 
-    assert result.record.disposition is CommandDisposition.REPLAYABLE
-    assert result.record.executable == command
+    assert result.record.disposition is not CommandDisposition.REDACTED
+    assert result.record.executable is None
 
 
 @pytest.mark.parametrize(

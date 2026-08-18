@@ -67,7 +67,10 @@ class Bridge:
             self._socket = None
         self._receive_buffer.clear()
         self.capability = None
-        self.next_sequence = 1
+        # Do NOT reset next_sequence here: the last-acknowledged sequence is
+        # preserved so already-accepted events are not replayed after a
+        # transient disconnect. The authoritative resume point comes from the
+        # server's register response on the next _register().
 
     def _fail(self) -> None:
         self.close()
@@ -121,7 +124,7 @@ class Bridge:
             "cwd": self.cwd,
             "sequence": 0,
         })
-        if set(response) != {"schema_version", "ok", "response", "capability"}:
+        if set(response) != {"schema_version", "ok", "response", "capability", "resume_sequence"}:
             raise ValueError("invalid register response")
         capability = response.get("capability")
         if (
@@ -133,7 +136,12 @@ class Bridge:
         ):
             raise ValueError("invalid register response")
         self.capability = capability
-        self.next_sequence = 1
+        # Resume from the server's persisted sequence watermark so events
+        # already accepted before the disconnect are not replayed (finding #11).
+        resume_sequence = response.get("resume_sequence", 0)
+        if not isinstance(resume_sequence, int) or resume_sequence < 0:
+            resume_sequence = 0
+        self.next_sequence = resume_sequence + 1
         self._retry_index = 0
         self._retry_at = 0.0
 

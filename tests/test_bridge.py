@@ -38,8 +38,8 @@ def local(event_type: str, **fields: object) -> bytes:
     return (json.dumps({"schema_version": 1, "type": event_type, "shell_id": SHELL_ID, **fields}, separators=(",", ":")) + "\n").encode()
 
 
-def register_reply(capability: str) -> dict[str, object]:
-    return {"schema_version": 1, "ok": True, "response": "register", "capability": capability}
+def register_reply(capability: str, *, resume_sequence: int = 0) -> dict[str, object]:
+    return {"schema_version": 1, "ok": True, "response": "register", "capability": capability, "resume_sequence": resume_sequence}
 
 
 def event_reply(sequence: int) -> dict[str, object]:
@@ -88,13 +88,17 @@ def test_bridge_reregisters_with_new_authority_after_service_restart() -> None:
         register_reply(CAPABILITY_A),
         event_reply(1),
         ConnectionResetError(),
-        register_reply(CAPABILITY_B),
-        event_reply(1),
+        # The server persisted last_sequence=1 and reports it so the bridge
+        # resumes at 2 instead of replaying event 1 (finding #11).
+        register_reply(CAPABILITY_B, resume_sequence=1),
+        event_reply(2),
     ])
     assert bridge.process_frame(local("prompt_ready", cwd="/one"))
     assert not bridge.process_frame(local("command_started", command_sequence=1, command="sleep 1"))
     assert bridge.capability is None
-    assert bridge.next_sequence == 1
+    # next_sequence is preserved across the transient failure (not reset to 1);
+    # it is resynchronised from the server's resume_sequence on re-register.
+    assert bridge.next_sequence == 2
     bridge._retry_at = 0.0
 
     assert bridge.process_frame(local("cwd_changed", cwd="/two"))
@@ -104,7 +108,7 @@ def test_bridge_reregisters_with_new_authority_after_service_restart() -> None:
     assert second_register["cwd"] == "/two"
     assert second_register["sequence"] == 0
     assert second_event["capability"] == CAPABILITY_B
-    assert second_event["sequence"] == 1
+    assert second_event["sequence"] == 2
 
 
 def test_bridge_rejects_malformed_or_mismatched_service_responses() -> None:

@@ -160,14 +160,14 @@ def test_build_attempt_resolves_only_current_selected_approved_commands(tmp_path
     assert [item.approved_command for item in adapter.items] == ["python -m http.server", None, None]
 
 
-def test_build_attempt_resolves_executable_past_var_assignment_prefix(tmp_path: Path) -> None:
-    # A REPLAYABLE command may carry VAR=value prefixes; the executable must be
-    # resolved by skipping those prefixes (not by treating the prefix as the
-    # command name, which would wrongly downgrade a replayable command).
+def test_build_attempt_resolves_executable_via_canonical_parsed_command(tmp_path: Path) -> None:
+    # Classification and recovery share one canonical ParsedCommand
+    # representation so they agree on the executable (regression: the two
+    # layers previously disagreed for ``VAR=value /bin/ls`` shapes).
     replayable = CommandRecord(
         1,
-        "FOO=bar python -m http.server",
-        "FOO=bar python -m http.server",
+        "python -m http.server",
+        "python -m http.server",
         CommandDisposition.REPLAYABLE,
         True,
     )
@@ -184,7 +184,16 @@ def test_build_attempt_resolves_executable_past_var_assignment_prefix(tmp_path: 
         lambda name: "/usr/bin/python" if name == "python" else None,
     )
     assert attempt.selected_item_ids == ("item",)
-    assert adapter.items[0].approved_command == "FOO=bar python -m http.server"
+    assert adapter.items[0].approved_command == "python -m http.server"
+
+
+def test_environment_assignment_prefix_command_is_not_replayable() -> None:
+    # The classifier must reject env-assignment prefixes so recovery never has
+    # to replay a captured LD_PRELOAD / PYTHONPATH mutation.
+    from termrecall.classifier import classify_command
+
+    record = classify_command("LD_PRELOAD=/tmp/x.so /bin/true", 1).record
+    assert record.disposition is not CommandDisposition.REPLAYABLE
 
 
 def test_persisted_unsupported_adapter_degrades_to_unavailable_without_launch(
