@@ -173,8 +173,8 @@ class MemoryReader:
 
 
 class MemoryWriter:
-    def __init__(self, peer_uid: int) -> None:
-        self.socket = SimpleNamespace(peer_uid=peer_uid)
+    def __init__(self, peer_uid: int, *, peer_pid: int = IDENTITY.pid) -> None:
+        self.socket = SimpleNamespace(peer_uid=peer_uid, peer_pid=peer_pid)
         self.data = bytearray()
         self.closed = False
 
@@ -203,13 +203,18 @@ def initial_state() -> EngineState:
 def server_factory(tmp_path: Path, initial_state: EngineState, monkeypatch):
     monkeypatch.setattr(
         "termrecall.server.get_peer_credentials",
-        lambda sock: PeerCredentials(99, getattr(sock, "peer_uid", os.getuid()), 99),
+        lambda sock: PeerCredentials(
+            getattr(sock, "peer_pid", IDENTITY.pid),
+            getattr(sock, "peer_uid", os.getuid()),
+            99,
+        ),
     )
 
     def make(
         runtime: Path | None = None,
         *,
         peer_uid: int = 1000,
+        peer_pid: int = IDENTITY.pid,
         service_uid: int = 1000,
         checkpoints: FakeCheckpoints | None = None,
         store: FakeStore | None = None,
@@ -230,14 +235,24 @@ def server_factory(tmp_path: Path, initial_state: EngineState, monkeypatch):
             process_probe=process_probe or (lambda _: ProcessProbe(ProcessStatus.DEAD)),
         )
         server.peer_uid = peer_uid
+        server.peer_pid = peer_pid
         return server
 
     return make
 
 
-async def dispatch(server: TermRecallServer, raw: bytes, *, uid: int | None = None):
+async def dispatch(
+    server: TermRecallServer,
+    raw: bytes,
+    *,
+    uid: int | None = None,
+    pid: int | None = None,
+):
     reader = MemoryReader(raw)
-    writer = MemoryWriter(server.peer_uid if uid is None else uid)
+    writer = MemoryWriter(
+        server.peer_uid if uid is None else uid,
+        peer_pid=server.peer_pid if pid is None else pid,
+    )
     await server.handle_connection(reader, writer)
     assert writer.closed
     return json.loads(writer.data), bytes(writer.data), reader
@@ -706,6 +721,30 @@ async def test_register_and_every_lifecycle_event_return_exact_typed_responses(s
 
 
 @pytest.mark.asyncio
+async def test_register_rejects_identity_pid_mismatch_with_peer_pid(server_factory) -> None:
+    server = server_factory()
+    # The wire identity claims pid 1234, but the connecting peer's real pid is
+    # 9999, so registration must be rejected as an impersonation attempt.
+    response, _, _ = await dispatch(server, register_wire(), pid=9999)
+    assert response == {
+        "schema_version": 1,
+        "ok": False,
+        "response": "error",
+        "error": {"code": "invalid_request", "message": "request rejected"},
+    }
+    assert server.state.registrations == {}
+
+
+@pytest.mark.asyncio
+async def test_register_accepts_matching_peer_pid(server_factory) -> None:
+    server = server_factory()
+    response, _, _ = await dispatch(server, register_wire(), pid=IDENTITY.pid)
+    assert response["ok"] is True
+    assert response["response"] == "register"
+    assert set(server.state.registrations) == {SHELL_ID}
+
+
+@pytest.mark.asyncio
 async def test_concurrent_registrations_are_serialized(server_factory) -> None:
     class YieldingCheckpoints(FakeCheckpoints):
         async def mark_dirty(self, generation: int) -> None:
@@ -718,7 +757,10 @@ async def test_concurrent_registrations_are_serialized(server_factory) -> None:
     second["shell_id"] = "shell-identifier-2"
     second["identity"] = dict(first["identity"], pid=4321)
 
-    responses = await asyncio.gather(dispatch(server, line(first)), dispatch(server, line(second)))
+    responses = await asyncio.gather(
+        dispatch(server, line(first)),
+        dispatch(server, line(second), pid=4321),
+    )
 
     assert all(response[0]["ok"] for response in responses)
     assert set(server.state.registrations) == {SHELL_ID, "shell-identifier-2"}

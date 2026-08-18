@@ -183,7 +183,6 @@ def test_destructive_and_stateful_interactive_commands_are_rejected(command: str
         "python worker.py --port 8000",
         "node server.js",
         "ruby worker.rb",
-        "perl worker.pl",
     ],
 )
 def test_interpreters_with_noninteractive_script_shape_are_replayable(command: str) -> None:

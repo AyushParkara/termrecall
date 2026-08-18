@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from termrecall.adapters.base import AdapterCapabilities, LaunchAction
+from termrecall.adapters.base import AdapterCapabilities, LaunchAction, _COMMAND_WRAPPER
 from termrecall.bridge import Bridge
 from termrecall.checkpoint import CheckpointManager
 from termrecall.client import ServiceClient
@@ -93,7 +94,7 @@ class RecordingAdapter:
                     "/usr/bin/gnome-terminal",
                     "--working-directory",
                     str(item.cwd),
-                    *(() if item.approved_command is None else ("--", "bash", "-lc", "command=$1; bash -lc \"$command\"", "termrecall", item.approved_command)),
+                    *(() if item.approved_command is None else ("--", "bash", "-c", _COMMAND_WRAPPER, "bash", *shlex.split(item.approved_command))),
                 ),
                 RestorationLevel.RECONSTRUCTED
                 if item.approved_command is not None
@@ -206,7 +207,7 @@ class SystemHarness:
         directory = Path(cwd)
         directory.mkdir(parents=True, exist_ok=True)
         number = len(self.shells) + 1
-        identity = ProcessIdentity(boot_id, pid or (10_000 + number), 20_000 + number)
+        identity = ProcessIdentity(boot_id, pid or os.getpid(), 20_000 + number)
         shell_id = f"shell-identifier-{number}"
         bridge = Bridge(self.socket_path, shell_id, identity)
         diagnostics: list[str] = []

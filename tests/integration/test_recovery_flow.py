@@ -32,8 +32,12 @@ async def test_real_service_bridge_capture_approval_retry_and_discard(system_har
         approved=(item_by_shell[shell_a.id],),
     )
     argv = {action.item_ids[0]: action.argv for action in system_harness.adapter.actions}
-    assert argv[item_by_shell[shell_a.id]].count("python3 -m http.server 8000") == 1
-    assert "sleep 100" not in argv[item_by_shell[shell_b.id]]
+    approved_argv = argv[item_by_shell[shell_a.id]]
+    # The approved command is passed as direct argv tokens (executed via
+    # ``exec "$@"``), so each shlex token must be present as an element.
+    assert approved_argv.count("python3") == 1
+    assert approved_argv.count("8000") == 1
+    assert "sleep" not in argv[item_by_shell[shell_b.id]]
 
     assert {outcome.item_id: outcome.kind for outcome in first.outcomes} == {
         item_by_shell[shell_a.id]: OutcomeKind.SUCCESS,

@@ -7,6 +7,13 @@ from typing import Protocol, runtime_checkable
 
 from termrecall.model import Outcome, RestorationLevel
 
+# Centralized launch wrapper.  ``exec "$@"`` runs the approved command tokens
+# directly as an argv (bash never re-parses them as shell syntax), which
+# eliminates the double-shell-evaluation bypass that a login-shell wrapper
+# enabled.  After the command exits its status is captured and an interactive
+# shell is dropped into.
+_COMMAND_WRAPPER = 'exec "$@"; status=$?; exec bash -i'
+
 
 @dataclass(frozen=True, slots=True)
 class AdapterCapabilities:

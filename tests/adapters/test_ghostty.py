@@ -5,12 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from termrecall.adapters.base import LaunchItem
+from termrecall.adapters.base import LaunchItem, _COMMAND_WRAPPER as WRAPPER
 from termrecall.adapters.ghostty import DEFAULT_LAUNCH_TIMEOUT, GhosttyAdapter
 from termrecall.model import OutcomeKind, RestorationLevel
 
 EXECUTABLE = "/usr/bin/ghostty"
-WRAPPER = 'command=$1; bash -lc "$command"; status=$?; exec bash -i; exit "$status"'
 
 
 def adapter_with_executable(
@@ -73,12 +72,19 @@ def test_approved_command_is_positional_data_in_fixed_wrapper(tmp_path: Path) ->
         f"--working-directory={tmp_path}",
         "-e",
         "bash",
-        "-lc",
+        "-c",
         WRAPPER,
-        "termrecall",
-        command,
+        "bash",
+        "printf",
+        "%s",
+        "$HOME; still data",
+        "printf",
+        "done",
     )
+    # The approved command is never interpolated into the wrapper script; its
+    # tokens are passed as positional argv that ``exec "$@"`` runs directly.
     assert command not in WRAPPER
+    assert "bash -lc" not in WRAPPER
     assert action.level is RestorationLevel.RECONSTRUCTED
 
 

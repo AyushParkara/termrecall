@@ -364,7 +364,9 @@ class TermRecallServer:
                     response = await self._dispatch_workspace_operation(request)
                 else:
                     async with self._dispatch_lock:
-                        response = await self._dispatch(request)
+                        response = await self._dispatch(
+                            request, peer_pid=peer.pid if peer is not None else None
+                        )
                 await self._write_response(writer, response)
                 if not persistent or not isinstance(request, (RegisterRequest, EventRequest)):
                     return
@@ -416,10 +418,14 @@ class TermRecallServer:
                 return await self._restore_retry(request)
             return await self._discard(request)
 
-    async def _dispatch(self, request: object) -> object:
+    async def _dispatch(
+        self, request: object, *, peer_pid: int | None = None
+    ) -> object:
         if isinstance(request, RegisterRequest):
             try:
-                updated, capability = register_shell(self.state, request)
+                updated, capability = register_shell(
+                    self.state, request, peer_pid=peer_pid
+                )
             except ValueError:
                 return _error(ErrorCode.INVALID_REQUEST)
             await self.checkpoints.mark_dirty(updated.dirty_generation)

@@ -113,6 +113,32 @@ _INTERACTIVE_STATEFUL = {
     "tmux",
     "screen",
 }
+# Commands that can execute arbitrary code through embedded interpreters,
+# exec actions, or config-driven hooks and therefore cannot be safely
+# replayed as a single simple argv.
+_CODE_EXECUTING = {
+    "awk", "gawk", "mawk", "nawk",
+    "sed",
+    "find",
+    "make", "cmake", "gmake",
+    "xargs",
+    "tar",
+    "git",
+    "perl",
+    "lua",
+    "tclsh", "wish", "tcl",
+    "php",
+    "dd",
+}
+# Shell reserved words/keywords that change control flow or syntax and so
+# cannot be replayed as a single simple command.
+_SHELL_RESERVED_WORDS = {
+    "time", "coproc", "!",
+    "function", "let", "select",
+    "for", "while", "until", "case", "if", "then", "else",
+    "do", "done", "fi", "esac", "in",
+    "local",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +196,28 @@ def classify_command(command: str, sequence: int) -> Classification:
                 True,
             ),
             "privileged or destructive command",
+        )
+    if executable in _CODE_EXECUTING:
+        return Classification(
+            CommandRecord(
+                sequence,
+                _bounded_display(command),
+                None,
+                CommandDisposition.UNSAFE,
+                True,
+            ),
+            "code-executing command",
+        )
+    if executable in _SHELL_RESERVED_WORDS:
+        return Classification(
+            CommandRecord(
+                sequence,
+                _bounded_display(command),
+                None,
+                CommandDisposition.UNSAFE,
+                True,
+            ),
+            "shell reserved word",
         )
     if _requires_unavailable_interactive_state(executable, tokens):
         return Classification(

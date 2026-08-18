@@ -146,6 +146,43 @@ def test_invalid_registration_is_rejected_before_capability_generation(
     assert empty_state.dirty_generation == 0
 
 
+def test_register_shell_rejects_identity_pid_mismatch_with_peer_pid(
+    empty_state: EngineState, register_request: RegisterRequest
+) -> None:
+    called = False
+
+    def capability_factory() -> str:
+        nonlocal called
+        called = True
+        return CAPABILITY
+
+    with pytest.raises(ValueError, match="identity does not match peer"):
+        register_shell(
+            empty_state,
+            register_request,
+            capability_factory,
+            peer_pid=9999,
+        )
+
+    assert not called
+    assert empty_state.snapshot.shells == ()
+    assert empty_state.registrations == {}
+    assert empty_state.dirty_generation == 0
+
+
+def test_register_shell_accepts_matching_peer_pid(
+    empty_state: EngineState, register_request: RegisterRequest
+) -> None:
+    state, capability = register_shell(
+        empty_state,
+        register_request,
+        lambda: CAPABILITY,
+        peer_pid=IDENTITY.pid,
+    )
+    assert capability == CAPABILITY
+    assert state.registrations[register_request.shell_id].identity == IDENTITY
+
+
 def test_reregistration_is_complete_authoritative_current_state(
     empty_state: EngineState, register_request: RegisterRequest
 ) -> None:

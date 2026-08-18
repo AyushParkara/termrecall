@@ -15,6 +15,7 @@ from pathlib import Path
 
 from termrecall.adapters.base import LaunchAction, LaunchItem, TerminalAdapter
 from termrecall.adapters.registry import SUPPORTED_ADAPTERS
+from termrecall.classifier import _command_name
 from termrecall.model import (
     CommandDisposition,
     RecoveryItemRecord,
@@ -289,7 +290,10 @@ def build_attempt(
                 tokens = shlex.split(command.executable)
             except ValueError:
                 tokens = []
-            if tokens and executable_resolver(tokens[0]) is not None:
+            # Resolve the executable past any VAR=value prefixes instead of
+            # treating the prefix itself as the command name.
+            name = _command_name(tokens)
+            if name and executable_resolver(name) is not None:
                 approved_command = command.executable
             else:
                 missing_executable.add(item_id)

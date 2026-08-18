@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from collections.abc import Callable, Sequence
 
@@ -9,12 +10,10 @@ from termrecall.adapters.base import (
     AdapterCapabilities,
     LaunchAction,
     LaunchItem,
+    _COMMAND_WRAPPER,
 )
 from termrecall.model import Outcome, OutcomeKind, RestorationLevel
 
-_COMMAND_WRAPPER = (
-    'command=$1; bash -lc "$command"; status=$?; exec bash -i; exit "$status"'
-)
 _GROUPING_WARNING = "grouping unsupported"
 _UNAVAILABLE_WARNING = "terminal executable unavailable"
 # Kitty launch must return promptly so restore requests cannot hang forever.
@@ -81,10 +80,10 @@ class KittyAdapter:
                 argv += (
                     "--hold",
                     "bash",
-                    "-lc",
+                    "-c",
                     _COMMAND_WRAPPER,
-                    "termrecall",
-                    item.approved_command,
+                    "bash",
+                    *shlex.split(item.approved_command),
                 )
                 level = RestorationLevel.RECONSTRUCTED
             actions.append(

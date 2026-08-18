@@ -65,6 +65,8 @@ def register_shell(
     state: EngineState,
     request: RegisterRequest,
     capability_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
+    *,
+    peer_pid: int | None = None,
 ) -> tuple[EngineState, str]:
     """Create an authoritative current shell registration."""
     if not isinstance(state, EngineState):
@@ -77,6 +79,8 @@ def register_shell(
         raise ValueError("invalid registration identity")
     if request.adapter not in SUPPORTED_ADAPTERS:
         raise ValueError("unsupported adapter")
+    if peer_pid is not None and request.identity.pid != peer_pid:
+        raise ValueError("identity does not match peer")
 
     shell = ShellRecord(
         request.shell_id,

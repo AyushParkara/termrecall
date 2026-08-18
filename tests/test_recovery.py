@@ -160,6 +160,33 @@ def test_build_attempt_resolves_only_current_selected_approved_commands(tmp_path
     assert [item.approved_command for item in adapter.items] == ["python -m http.server", None, None]
 
 
+def test_build_attempt_resolves_executable_past_var_assignment_prefix(tmp_path: Path) -> None:
+    # A REPLAYABLE command may carry VAR=value prefixes; the executable must be
+    # resolved by skipping those prefixes (not by treating the prefix as the
+    # command name, which would wrongly downgrade a replayable command).
+    replayable = CommandRecord(
+        1,
+        "FOO=bar python -m http.server",
+        "FOO=bar python -m http.server",
+        CommandDisposition.REPLAYABLE,
+        True,
+    )
+    items = (
+        RecoveryItemRecord("item", shell(shell_id="a", cwd=str(tmp_path), command=replayable), "previous_boot"),
+    )
+    record = RecoveryRecord(1, "workspace", 7, 13.5, items, (), ())
+    adapter = RecordingAdapter()
+    attempt, _ = build_attempt(
+        record,
+        ("item",),
+        {"item"},
+        adapter,
+        lambda name: "/usr/bin/python" if name == "python" else None,
+    )
+    assert attempt.selected_item_ids == ("item",)
+    assert adapter.items[0].approved_command == "FOO=bar python -m http.server"
+
+
 def test_persisted_unsupported_adapter_degrades_to_unavailable_without_launch(
     tmp_path: Path,
 ) -> None:
