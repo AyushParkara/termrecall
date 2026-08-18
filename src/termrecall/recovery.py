@@ -14,6 +14,7 @@ from pathlib import Path
 
 from termrecall.adapters.base import LaunchAction, LaunchItem, TerminalAdapter
 from termrecall.adapters.registry import SUPPORTED_ADAPTERS
+from termrecall.adapters.resume import build_resume_argv, find_resume_adapter
 from termrecall.classifier import _parse_one_simple_command
 from termrecall.model import (
     CommandDisposition,
@@ -278,30 +279,48 @@ def build_attempt(
             continue
         command = stored.shell.command
         approved_command: str | None = None
-        if (
-            item_id in approved
-            and command is not None
-            and command.active
-            and command.disposition is CommandDisposition.REPLAYABLE
-            and command.executable is not None
-        ):
-            # Use the same canonical ParsedCommand representation the
-            # classifier produces so classification and recovery agree on what
-            # the executable is (finding: the two layers previously had
-            # different models, e.g. ``PATH=/tmp /bin/ls`` resolved the prefix
-            # as the command name).
-            try:
-                parsed = _parse_one_simple_command(command.executable)
-            except ValueError:
-                parsed = None
-            if (
-                parsed is None
-                or not parsed.executable
-                or executable_resolver(parsed.executable) is None
+        if item_id in approved and command is not None and command.active:
+            # First, try the session-resume path: if the captured launch
+            # command is a recognized session-persistent tool (codex, opencode,
+            # pi, hermes, ...), substitute the tool's native resume argv.  The
+            # resume argv is a fixed, hand-verified argv (never reconstructed
+            # from user input) so it bypasses the replay-classifier expansion
+            # surface; resume relies on the tool's own cwd-keyed session lookup.
+            executable_name: str | None = None
+            captured_text = command.executable if command.executable else command.display
+            if captured_text:
+                try:
+                    parsed_for_resume = _parse_one_simple_command(captured_text)
+                    executable_name = parsed_for_resume.executable
+                except ValueError:
+                    executable_name = None
+            resume_adapter = find_resume_adapter(executable_name) if executable_name else None
+            if resume_adapter is not None:
+                resume_argv = build_resume_argv(resume_adapter, None)
+                resume_executable = resume_argv[0] if resume_argv else None
+                if resume_executable and executable_resolver(resume_executable) is None:
+                    missing_executable.add(item_id)
+                else:
+                    approved_command = " ".join(resume_argv)
+            elif (
+                command.disposition is CommandDisposition.REPLAYABLE
+                and command.executable is not None
             ):
-                missing_executable.add(item_id)
-            else:
-                approved_command = command.executable
+                # Plain replayable command: use the same canonical ParsedCommand
+                # representation the classifier produces so classification and
+                # replay agree on what the executable is.
+                try:
+                    parsed = _parse_one_simple_command(command.executable)
+                except ValueError:
+                    parsed = None
+                if (
+                    parsed is None
+                    or not parsed.executable
+                    or executable_resolver(parsed.executable) is None
+                ):
+                    missing_executable.add(item_id)
+                else:
+                    approved_command = command.executable
         directory, _ = resolve_directory(Path(stored.shell.cwd), home or Path.home())
         launches.append(LaunchItem(item_id, directory, approved_command))
 
