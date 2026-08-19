@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Resume-adapter tests.
+"""Universal resume-engine tests.
 
-Verifies that session-persistent tools (codex, opencode, pi, hermes) are
-restored via their native resume command rather than replaying the launch
-argv, while ordinary replayable commands are unaffected.
+Verifies the convention-probe resolves each tool's best resume form WITHOUT any
+hard-coded per-tool entry, that session-id forms work, that non-session tools
+are rejected, and that resume argv is free of shell expansions/globs/env
+assignments so it can safely bypass the replay classifier.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from termrecall.adapters.resume import ResumeAdapter, build_resume_argv, find_resume_adapter
+from termrecall.adapters.resume import (
+    ResumeContract,
+    ResumeMatch,
+    build_resume_argv,
+    find_resume_adapter,
+)
 from termrecall.classifier import _parse_one_simple_command
 from termrecall.model import CommandDisposition, CommandRecord, RecoveryItemRecord, RecoveryRecord, ShellRecord
 from termrecall.recovery import build_attempt
@@ -29,40 +35,80 @@ def _shell(cwd: str, command: CommandRecord) -> ShellRecord:
     return ShellRecord("a", None, "gnome-terminal", cwd, 0, command, None)
 
 
-@pytest.mark.parametrize("tool,expected", [
-    ("codex", "codex resume --last"),
-    ("opencode", "opencode"),
-    ("pi", "pi --continue"),
-    ("hermes", "hermes --continue"),
+# Hermetic --help texts modelled on each tool's real output (verified
+# 2026-08-18).  The probe must resolve the BEST form per tool without a
+# registry entry.
+HELP = {
+    "codex": """
+  resume          Resume a previous interactive session (picker by default; use --last to continue
+  archive         Archive a saved session by id or session name
+""",
+    "pi": """
+  --continue, -c                 Continue previous session
+  --resume, -r                   Select a session to resume
+  --session <path|id>            Use specific session file or partial UUID
+""",
+    "hermes": """
+  --resume SESSION, -r SESSION   Resume a previous session by ID or title
+  --continue [SESSION_NAME]      Resume a session by name, or the most recent if no
+""",
+    "opencode": """
+  -c, --continue      continue the last session
+  -s, --session       session id to continue
+  opencode session                manage sessions
+""",
+    # Non-session tools that must NOT match:
+    "wget": "GNU Wget: download files\n  --continue      continue a partial download\n",
+    "curl": "curl [options] url\n  -C, --continue-at  resume transfer\n",
+    "bash": "GNU bash, version 5\n  --posix\n  --restricted\n",
+}
+
+
+def _resolver(name: str) -> str | None:
+    return f"/usr/bin/{name}" if name in HELP else None
+
+
+def _probe(exe: str, resolver) -> str:
+    return HELP.get(exe, "")
+
+
+@pytest.mark.parametrize("exe,expected_cwd,expected_with_id", [
+    ("codex", ("codex", "resume", "--last"), ("codex", "resume", "SID")),
+    ("pi", ("pi", "--continue"), ("pi", "--session", "SID")),
+    ("hermes", ("hermes", "--continue"), ("hermes", "--session", "SID")),
+    ("opencode", ("opencode", "--continue"), ("opencode", "--session", "SID")),
 ])
-def test_resume_adapter_substitutes_native_resume_command(tool: str, expected: str) -> None:
-    command = CommandRecord(1, tool, tool, CommandDisposition.REPLAYABLE, True)
-    record = RecoveryRecord(1, "ws", 7, 13.5,
-        (RecoveryItemRecord("item", _shell("/srv/app", command), "previous_boot"),), (), ())
-    adapter = RecordingAdapter()
-    build_attempt(record, ("item",), {"item"}, adapter,
-        lambda name: f"/usr/bin/{name}" if name == tool else None)
-    assert adapter.items[0].approved_command == expected
+def test_probe_resolves_best_resume_form(exe, expected_cwd, expected_with_id, monkeypatch):
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output", _probe)
+    monkeypatch.setattr("termrecall.adapters.resume.shutil.which", _resolver)
+    match = find_resume_adapter(exe, resolver=_resolver)
+    assert match is not None
+    assert match.source == "probe"
+    assert build_resume_argv(match, None) == expected_cwd
+    assert build_resume_argv(match, "SID") == expected_with_id
 
 
-def test_resume_works_even_when_launch_was_unsafe() -> None:
-    # An UNSAFE launch (executable is None) must still resume via display text.
+@pytest.mark.parametrize("exe", ["wget", "curl", "bash"])
+def test_non_session_tools_are_rejected(exe, monkeypatch):
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output", _probe)
+    match = find_resume_adapter(exe, resolver=_resolver)
+    assert match is None
+
+
+def test_resume_works_even_when_launch_was_unsafe(monkeypatch):
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output", _probe)
+    monkeypatch.setattr("termrecall.adapters.resume.shutil.which", _resolver)
     command = CommandRecord(1, "codex --yolo", None, CommandDisposition.UNSAFE, True)
     record = RecoveryRecord(1, "ws", 7, 13.5,
         (RecoveryItemRecord("item", _shell("/srv", command), "previous_boot"),), (), ())
     adapter = RecordingAdapter()
-    build_attempt(record, ("item",), {"item"}, adapter,
-        lambda name: "/usr/bin/codex" if name == "codex" else None)
+    build_attempt(record, ("item",), {"item"}, adapter, _resolver)
     assert adapter.items[0].approved_command == "codex resume --last"
 
 
-def test_resume_uses_session_id_when_provided() -> None:
-    adapter = find_resume_adapter("codex")
-    assert adapter is not None
-    assert build_resume_argv(adapter, "abc-123") == ("codex", "resume", "abc-123")
-
-
-def test_non_resume_command_replays_original_argv() -> None:
+def test_non_resume_command_replays_original_argv(monkeypatch):
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output", _probe)
+    monkeypatch.setattr("termrecall.adapters.resume.shutil.which", _resolver)
     command = CommandRecord(1, "sleep 10", "sleep 10", CommandDisposition.REPLAYABLE, True)
     record = RecoveryRecord(1, "ws", 7, 13.5,
         (RecoveryItemRecord("item", _shell("/srv", command), "previous_boot"),), (), ())
@@ -72,23 +118,31 @@ def test_non_resume_command_replays_original_argv() -> None:
     assert adapter.items[0].approved_command == "sleep 10"
 
 
-def test_resume_argv_is_free_of_expansions_and_globs() -> None:
-    # The resume argv bypasses the classifier, so it must be a literal argv
-    # with no shell expansions, globs, or env assignments.
-    for adapter_name in ("codex", "opencode", "pi", "hermes"):
-        adapter = find_resume_adapter(adapter_name)
-        assert adapter is not None
-        for argv in (adapter.resume_argv, adapter.fallback_argv):
-            if argv is None:
-                continue
+def test_resume_argv_is_free_of_expansions_globs_env(monkeypatch):
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output", _probe)
+    monkeypatch.setattr("termrecall.adapters.resume.shutil.which", _resolver)
+    for exe in ("codex", "pi", "hermes", "opencode"):
+        match = find_resume_adapter(exe, resolver=_resolver)
+        assert match is not None
+        for argv in (build_resume_argv(match, None), build_resume_argv(match, "SID")):
             text = " ".join(argv)
-            assert "$" not in text, f"{adapter_name}: expansion in resume argv"
-            assert "*" not in text and "?" not in text and "[" not in text, f"{adapter_name}: glob in resume argv"
-            # Must parse as one simple command with a known executable.
+            assert "$" not in text, f"{exe}: expansion in resume argv"
+            assert "*" not in text and "?" not in text and "[" not in text, f"{exe}: glob in resume argv"
             parsed = _parse_one_simple_command(text)
-            assert parsed.executable == adapter_name
+            assert parsed.executable == exe
 
 
-def test_unknown_executable_has_no_resume_adapter() -> None:
-    assert find_resume_adapter("vim") is None
-    assert find_resume_adapter("") is None
+def test_prose_mention_does_not_trigger_false_resume(monkeypatch):
+    # A tool whose --help mentions "resume"/"continue" only in prose, with no
+    # session context, must NOT be matched.
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output",
+        lambda exe, res: "usage: foo\n  --verbose   print more\n  note: this tool cannot resume a session.\n" if exe == "foo" else "")
+    match = find_resume_adapter("foo", resolver=lambda n: "/bin/foo" if n == "foo" else None)
+    assert match is None
+
+
+def test_unknown_executable_with_no_resume_returns_none(monkeypatch):
+    monkeypatch.setattr("termrecall.adapters.resume._probe_help_output",
+        lambda exe, res: "usage: idff\n  --serve   run server\n" if exe == "idff" else "")
+    match = find_resume_adapter("idff", resolver=lambda n: "/usr/bin/idff" if n == "idff" else None)
+    assert match is None
