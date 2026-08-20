@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Minimal container for running the TermRecall test suite without a GUI.
+# Proves the core (classifier, store, recovery, sessions, resume, server logic)
+# works in an isolated, reproducible environment.
+#
+#   docker build -f Dockerfile.test -t termrecall-test .
+#   docker run --rm termrecall-test
+#
+# Tests that require real Unix-socket peer credentials or binding sockets
+# (SO_PEERCRED / bind) need --cap-add=SYS_PTRACE or --privileged, and GUI
+# tests are out of scope here.
+
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc python3-dev libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml setup.py ./
+COPY src ./src
+COPY tests ./tests
+
+RUN python -m pip install --no-cache-dir pytest pytest-asyncio \
+    && pip install --no-cache-dir --no-build-isolation -e .
+
+# Run the unit suite, deselecting tests that need real socket bind/peer-creds
+# (not available in an unprivileged container).
+CMD ["python", "-m", "pytest", "-q", \
+     "--deselect", "tests/test_bridge.py::test_bridge_real_socket_reconnects_after_malformed_reply_and_uses_new_capability", \
+     "tests/"]

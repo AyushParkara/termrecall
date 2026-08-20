@@ -31,7 +31,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 
@@ -192,11 +192,25 @@ def _find_contract_by_name(contract_name: str) -> ResumeContract | None:
     return None
 
 
+# Cache probe results (help text) per executable so a single restore/list
+# pass that calls find_resume_adapter several times for the same tool does
+# not re-spawn ``<exe> --help`` each time.
+_PROBE_CACHE: dict[tuple[str, str], str] = {}
+
+
 def _probe_help_output(executable: str, resolver: ExecutableResolver) -> str:
-    """Return the lower-cased ``<exe> --help`` text, or "" on failure."""
+    """Return the lower-cased ``<exe> --help`` text, or "" on failure.
+
+    Cached per (executable, resolved-path) so repeated calls during one restore
+    don't re-spawn the tool's --help subprocess.
+    """
     path = resolver(executable)
     if path is None:
         return ""
+    cache_key = (executable, path)
+    cached = _PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         completed = subprocess.run(
             (path, "--help"),
@@ -206,8 +220,11 @@ def _probe_help_output(executable: str, resolver: ExecutableResolver) -> str:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return (completed.stdout + "\n" + completed.stderr).lower()
+        result = ""
+    else:
+        result = (completed.stdout + "\n" + completed.stderr).lower()
+    _PROBE_CACHE[cache_key] = result
+    return result
 
 
 _WORD_RE = re.compile(r"[a-z0-9_-]+")
@@ -231,9 +248,10 @@ def _help_mentions(text: str, signature: tuple[str, ...]) -> bool:
 
     A flag signature (``--continue``, ``--resume``) matches only when the help
     text also mentions session-oriented context (``session``/``last``/
-    ``previous``/``conversation``/``history``) near the flag, so a tool that
-    uses ``--continue`` to mean "continue a download" is not mistaken for a
-    session-resume tool.
+    ``previous``/``conversation``/``history``) anywhere in the output, so a
+    tool that uses ``--continue`` to mean "continue a download" with no session
+    language is not mistaken for a session-resume tool.  (The match is
+    global, not proximity-based — a documented limit.)
 
     A bare-word subcommand signature (``resume``) must appear as a *listed
     command* (start of an indented help line), not a prose mention, to avoid
@@ -303,5 +321,3 @@ def build_resume_argv(match: ResumeMatch, session_id: str | None) -> tuple[str, 
     return match.contract.build(match.executable, session_id)
 
 
-# Backwards-compatible aliases retained for callers that imported the old names.
-ResumeAdapter = ResumeMatch

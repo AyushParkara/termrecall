@@ -301,13 +301,17 @@ def build_attempt(
                 # then fall back to the most-recent session the tool recorded in
                 # this cwd (handles the multi-session case deterministically).
                 session_id: str | None = None
+                # Resolve the exact session id: prefer a live env var, then the
+                # most-recent session recorded for this cwd.  Fail closed
+                # (None) on the expected store-read errors so restore still
+                # proceeds via the cwd-only resume fallback.
                 try:
                     from termrecall.sessions import find_active_session_id, find_sessions_for_cwd
                     session_id = find_active_session_id(resume_adapter.executable)
                     if session_id is None:
-                        matches = find_sessions_for_cwd(str(directory) if directory else str(Path(stored.shell.cwd)))
+                        matches = find_sessions_for_cwd(str(Path(stored.shell.cwd)))
                         session_id = matches[0].session_id if matches else None
-                except Exception:
+                except (OSError, ValueError, KeyError):
                     session_id = None
                 resume_argv = build_resume_argv(resume_adapter, session_id)
                 resume_executable = resume_argv[0] if resume_argv else None

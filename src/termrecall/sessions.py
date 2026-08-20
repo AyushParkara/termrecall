@@ -249,11 +249,19 @@ _NON_AGENT_DOTDIRS = {
 }
 # Candidate session files: .jsonl with a UUID in the name, under a hidden dir.
 _SESSION_FILE_RE = re.compile(r".*\.jsonl$", re.I)
+import time as _time
+
+# Cache list_sessions results keyed by home path; invalidated by mtime of the
+# home dir's parent (cheap stat).  Prevents re-scanning 300+ files on every
+# per-item find_sessions_for_cwd call during a single restore.
+_SESSION_CACHE: dict[tuple[str, float], list[SessionRecord]] = {}
+_SESSION_CACHE_TTL = 5.0  # seconds; a restore runs in well under this
+
 
 # Maximum records to scan when extracting a summary (first user prompt) + the
 # full timestamp span + record count.  200 is enough to find a real user prompt
 # while staying cheap (readline + json on small lines).
-_SUMMARY_SCAN_LIMIT = 200
+_SUMMARY_SCAN_LIMIT = 40
 # Truncate the summary so the restore UI stays scannable.
 _SUMMARY_MAX_CHARS = 160
 
@@ -346,6 +354,80 @@ def _summarize_session_file(path: Path) -> tuple[str, str, str, int]:
     except (OSError, json.JSONDecodeError):
         pass
     return summary, first_ts, last_ts, count
+
+
+def _scan_session_full(path: Path) -> tuple[str | None, str | None, str, str, str, int]:
+    """Single-pass scan: extract session_id, cwd, summary, timestamps, count.
+
+    Combines what _scan_first_record_for_session_cwd and _summarize_session_file
+    did separately, so each file is read exactly once.  Returns
+    (session_id, cwd, summary, first_ts, last_ts, count).
+    """
+    session_id: str | None = None
+    cwd: str | None = None
+    summary = ""
+    first_ts = ""
+    last_ts = ""
+    count = 0
+    try:
+        with path.open("rb") as handle:
+            for _ in range(_SUMMARY_SCAN_LIMIT):
+                line = handle.readline()
+                if not line:
+                    break
+                count += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                ts = record.get("timestamp")
+                if isinstance(ts, str):
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+                # session id
+                if session_id is None:
+                    for key in ("sessionId", "session_id", "id"):
+                        value = payload.get(key)
+                        if isinstance(value, str) and _UUID_RE.fullmatch(value):
+                            session_id = value
+                            break
+                    nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                    if session_id is None and isinstance(nested.get("id"), str) and _UUID_RE.fullmatch(nested["id"]):
+                        session_id = nested["id"]
+                # cwd
+                if cwd is None:
+                    for key in ("cwd", "directory", "workdir", "project_path"):
+                        value = payload.get(key)
+                        if isinstance(value, str):
+                            if value.startswith("file://"):
+                                value = value[len("file://"):]
+                            if value.startswith("/"):
+                                cwd = value
+                                break
+                # summary (first real user prompt)
+                if not summary:
+                    role = payload.get("role") or record.get("role")
+                    if role is None and record.get("type") == "user":
+                        role = "user"
+                    if role == "user":
+                        text = _extract_text(payload.get("content"))
+                        msg = record.get("message")
+                        if isinstance(msg, dict) and not text:
+                            text = _extract_text(msg.get("content"))
+                        if _is_real_prompt(text):
+                            summary = text[:_SUMMARY_MAX_CHARS]
+                if session_id and cwd and summary:
+                    break
+    except (OSError, json.JSONDecodeError):
+        pass
+    return session_id, cwd, summary, first_ts, last_ts, count
 
 
 def _make_file_record(tool: str, session_id: str, path: Path, cwd: str, title: str = "") -> SessionRecord:
@@ -443,7 +525,9 @@ def _discover_generic_sessions(home: Path) -> list[SessionRecord]:
             # Require a UUID in the filename or path (session-id-bearing file).
             if not _UUID_RE.search(str(path)):
                 continue
-            session_id, cwd = _scan_first_record_for_session_cwd(path)
+            # Single-pass scan: extract id, cwd, AND summary from one read of
+            # the file (the old code read it twice via two separate scanners).
+            session_id, cwd, summary, first_ts, last_ts, count = _scan_session_full(path)
             if session_id is None:
                 # Fall back to the UUID in the filename.
                 m = _UUID_RE.search(path.name)
@@ -451,7 +535,11 @@ def _discover_generic_sessions(home: Path) -> list[SessionRecord]:
                     session_id = m.group(0)
             if session_id is None:
                 continue
-            records.append(_make_file_record(tool_name, session_id, path, cwd or "", ""))
+            records.append(SessionRecord(
+                tool=tool_name, session_id=session_id, cwd=cwd or "",
+                title="", summary=summary, first_activity=first_ts,
+                last_activity=last_ts, record_count=count, source_path=str(path),
+            ))
     return records
 
 
@@ -503,6 +591,25 @@ def list_sessions(
     return records
 
 
+def _list_sessions_cached(home_path: Path) -> list[SessionRecord]:
+    """Cached list_sessions over the full home, so a single restore (which
+    calls find_sessions_for_cwd once per item) does not re-scan 300+ files
+    each time.  Keyed by home-dir mtime so a freshly-written session (which
+    bumps the mtime) invalidates the cache automatically.
+    """
+    try:
+        mtime = home_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cache_key = (str(home_path), mtime)
+    cached = _SESSION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    records = list_sessions(home=lambda: home_path)
+    _SESSION_CACHE[cache_key] = records
+    return records
+
+
 def find_sessions_for_cwd(
     cwd: str,
     *,
@@ -513,12 +620,14 @@ def find_sessions_for_cwd(
 
     Handles the multi-session case: if a user ran codex in the same directory
     multiple times, all matching sessions are returned ordered by last
-    activity (descending).  The caller can then resume the most recent, or
-    offer the user a picker.
+    activity (descending).  Uses a short-lived cache so that a single
+    restore (which calls this once per item) does not re-scan 300+ files.
     """
+    home_path = home()
     target = os.path.normpath(cwd)
+    all_records = _list_sessions_cached(home_path) if tool is None else list_sessions(tool=tool, home=home)
     matching = [
-        r for r in list_sessions(tool=tool, home=home)
+        r for r in all_records
         if r.cwd and os.path.normpath(r.cwd) == target
     ]
     matching.sort(key=lambda r: r.last_activity or "", reverse=True)
