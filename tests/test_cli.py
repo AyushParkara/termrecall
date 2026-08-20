@@ -341,3 +341,72 @@ def test_ctrl_c_is_refused_without_request(monkeypatch: pytest.MonkeyPatch) -> N
             raise KeyboardInterrupt
     assert cli.run(["restore"], Interrupt(), io.StringIO(), io.StringIO()) == 2
     assert len(client.requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# Resume-aware restore UI (real resume command + summary + multi-session picker)
+# ---------------------------------------------------------------------------
+
+def _codex_item(item_id: str = "item-c", cwd: str = "/srv/codex") -> RecoveryItemView:
+    """A recovery item whose stored command is a resume-capable tool (codex)."""
+    display = type("Display", (), {"value": "codex"})()
+    return RecoveryItemView(item_id, "shell-c", SafeExternalText.catalog("previous_boot"), RestorationLevel.RECONSTRUCTED, cwd, None, display, True)
+
+
+def test_show_item_displays_resume_command_not_restart_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Stub the resume/sessions engines so the test is hermetic.
+    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe})() if exe == "codex" else None)
+    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", sid) if sid else ("codex", "resume", "--last"))
+    monkeypatch.setattr(cli, "find_sessions_for_cwd", lambda cwd: [type("S", (), {"session_id": "abc-123", "summary": "fix the login bug", "first_activity": "2026-08-01", "last_activity": "2026-08-02", "title": "", "tool": "codex"})()])
+    stdout = io.StringIO()
+    cli._show_item(_codex_item(), stdout)
+    out = stdout.getvalue()
+    assert "will resume: codex resume abc-123" in out
+    assert "session summary: fix the login bug" in out
+    assert "sessions in this directory: 1" in out
+    # The misleading old warning must NOT appear for resume-capable tools.
+    assert "would be restarted, not resumed" not in out
+
+
+def test_show_item_falls_back_to_replay_warning_for_plain_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    # python is a non-resume executable; the old replay warning should show.
+    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: None)
+    display = type("Display", (), {"value": "python app.py"})()
+    item = RecoveryItemView("item-d", "shell-d", SafeExternalText.catalog("previous_boot"), RestorationLevel.RECONSTRUCTED, "/srv", None, display, True)
+    stdout = io.StringIO()
+    cli._show_item(item, stdout)
+    out = stdout.getvalue()
+    assert "active command: python app.py" in out
+    assert "would be restarted, not resumed" in out
+
+
+def test_approvals_resume_defaults_to_yes_on_enter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe})() if exe == "codex" else None)
+    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", "--last"))
+    monkeypatch.setattr(cli, "find_sessions_for_cwd", lambda cwd: [])
+    item = _codex_item()
+    stdin = io.StringIO("\n")  # Enter = default yes
+    stdout = io.StringIO()
+    approved = cli._approvals((item,), {item.item_id}, stdin, stdout, directory_only=False)
+    assert approved == (item.item_id,)
+    assert "Resume this session? [Y/n]" in stdout.getvalue()
+
+
+def test_approvals_multi_session_picker_shows_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe})() if exe == "codex" else None)
+    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", sid))
+    sessions = [
+        type("S", (), {"session_id": "sess-1", "summary": "", "first_activity": "2026-08-01", "last_activity": "2026-08-01", "title": "", "tool": "codex"}),
+        type("S", (), {"session_id": "sess-2", "summary": "build the dashboard", "first_activity": "2026-07-01", "last_activity": "2026-07-05", "title": "", "tool": "codex"}),
+    ]
+    monkeypatch.setattr(cli, "find_sessions_for_cwd", lambda cwd: sessions)
+    item = _codex_item()
+    # Pick session 2 (the one with a summary), then approve with Enter.
+    stdin = io.StringIO("2\n\n")
+    stdout = io.StringIO()
+    approved = cli._approvals((item,), {item.item_id}, stdin, stdout, directory_only=False)
+    out = stdout.getvalue()
+    assert "2 sessions found" in out
+    assert "build the dashboard" in out
+    assert "resuming: codex resume sess-2" in out
+    assert approved == (item.item_id,)

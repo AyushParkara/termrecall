@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import TextIO
 
 from termrecall.client import ServiceClient, ServiceUnavailable
+from termrecall.adapters.resume import build_resume_argv, find_resume_adapter
+from termrecall.classifier import _parse_one_simple_command
+from termrecall.sessions import find_sessions_for_cwd
 from termrecall.paths import XDGPaths, resolve_paths
 from termrecall.protocol import (
     DiscardRequest,
@@ -157,6 +160,34 @@ def _snapshot(client: ServiceClient, stdout: TextIO, stderr: TextIO) -> int:
     return EXIT_OK
 
 
+def _resume_display_for_item(item: RecoveryItemView) -> tuple[str, str, int, str]:
+    """Resolve what will actually run for an item, for display only.
+
+    Returns (resume_command, summary, session_count, tool_name).  When the
+    stored command is a session-persistent tool, this is the tool's native
+    resume command plus the best-matching session's summary.  Otherwise it
+    falls back to the plain replay command with no session context.
+    """
+    command_text = item.replay_display.value if item.replay_display else ""
+    if not command_text:
+        return "", "", 0, ""
+    try:
+        parsed = _parse_one_simple_command(command_text)
+        executable = parsed.executable
+    except ValueError:
+        return command_text, "", 0, ""
+    match = find_resume_adapter(executable)
+    if match is None:
+        # Plain replayable command, no resume.
+        return command_text, "", 0, executable
+    # Find matching sessions for this cwd (most-recent first).
+    matches = find_sessions_for_cwd(str(item.directory))
+    session_id = matches[0].session_id if matches else None
+    summary = matches[0].summary if matches else ""
+    resume_argv = build_resume_argv(match, session_id)
+    return " ".join(resume_argv), summary, len(matches), executable
+
+
 def _show_item(item: RecoveryItemView, stdout: TextIO) -> None:
     print(f"  {item.item_id} (shell {item.shell_id})", file=stdout)
     print(f"    restoration level: {item.level.value.upper()}", file=stdout)
@@ -165,8 +196,21 @@ def _show_item(item: RecoveryItemView, stdout: TextIO) -> None:
     if item.directory_warning is not None:
         print(f"    directory warning: {_safe_value(item.directory_warning)}", file=stdout)
     if item.replay_display is not None:
-        print(f"    active command: {_safe_value(item.replay_display)}", file=stdout)
-        print("    warning: this command would be restarted, not resumed", file=stdout)
+        resume_command, summary, session_count, tool = _resume_display_for_item(item)
+        if session_count > 0:
+            # Session-persistent tool: show what will actually run + context.
+            print(f"    will resume: {resume_command}", file=stdout)
+            if summary:
+                print(f"    session summary: {summary}", file=stdout)
+            print(f"    sessions in this directory: {session_count} (most recent selected)", file=stdout)
+        elif resume_command and tool and find_resume_adapter(tool) is not None:
+            # Resume-capable tool but no stored session found yet.
+            print(f"    will resume: {resume_command}", file=stdout)
+            print("    note: no matching session found; will start fresh", file=stdout)
+        else:
+            # Plain replayable command (no resume semantics).
+            print(f"    active command: {resume_command or _safe_value(item.replay_display)}", file=stdout)
+            print("    warning: this command would be restarted, not resumed", file=stdout)
     elif item.level.value == "partial":
         print("    warning: only the terminal and directory can be restored", file=stdout)
 
@@ -237,10 +281,46 @@ def _approvals(items: Sequence[RecoveryItemView], selected: set[str], stdin: Tex
     for item in items:
         if item.item_id not in selected or not item.replay_eligible or item.replay_display is None:
             continue
-        print(f"Exact stored command for {item.item_id}: {_safe_value(item.replay_display)}", file=stdout)
-        print(f"Run this command in restored item {item.item_id}? [y/N] ", end="", file=stdout)
+        resume_command, summary, session_count, tool = _resume_display_for_item(item)
+        is_resume = bool(tool and find_resume_adapter(tool) is not None)
+        if is_resume:
+            print(f"Restore item {item.item_id}:", file=stdout)
+            print(f"  command: {resume_command}", file=stdout)
+            # If multiple sessions match this cwd, offer a picker so the user
+            # can choose which historical session to resume.
+            matches = find_sessions_for_cwd(str(item.directory)) if session_count > 1 else []
+            if len(matches) > 1:
+                print(f"  {len(matches)} sessions found in {item.directory}:", file=stdout)
+                for idx, m in enumerate(matches, 1):
+                    label = m.summary or m.title or m.session_id
+                    span = f"{m.first_activity[:10]}..{m.last_activity[:10]}" if m.first_activity else "unknown date"
+                    print(f"    {idx}: {label}  [{m.tool}]  {span}", file=stdout)
+                print(f"  Resume session number (1-{len(matches)}, Enter=most-recent, 0=skip): ", end="", file=stdout)
+                answer = _readline(stdin)
+                if answer is None or answer.strip() == "" or answer.strip() == "0":
+                    if answer is not None and answer.strip() == "0":
+                        continue
+                    chosen = matches[0]
+                else:
+                    try:
+                        chosen = matches[int(answer.strip()) - 1]
+                    except (ValueError, IndexError):
+                        continue
+                match = find_resume_adapter(tool)
+                resume_command = " ".join(build_resume_argv(match, chosen.session_id))
+                print(f"  resuming: {resume_command}", file=stdout)
+            elif summary:
+                print(f"  session: {summary}", file=stdout)
+            print(f"Resume this session? [Y/n] ", end="", file=stdout)
+        else:
+            print(f"Stored command for {item.item_id}: {resume_command or _safe_value(item.replay_display)}", file=stdout)
+            print(f"Run this command in restored item {item.item_id}? [y/N] ", end="", file=stdout)
         answer = _readline(stdin)
-        if answer is not None and answer.strip().casefold() in {"y", "yes"}:
+        default_yes = is_resume  # resume defaults to yes (sensible); replay defaults to no
+        if answer is None:
+            continue
+        ok = answer.strip().casefold() in {"y", "yes"} or (default_yes and answer.strip() == "")
+        if ok:
             approved.append(item.item_id)
     return tuple(approved)
 
