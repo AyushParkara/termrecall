@@ -237,3 +237,70 @@ def test_generic_discovery_dedups_with_explicit_readers(tmp_path: Path, monkeypa
     codex = [r for r in sessions if r.tool == "codex"]
     # Each session appears exactly once.
     assert len(codex) == len({r.session_id for r in codex})
+
+
+# ---------------------------------------------------------------------------
+# Session summary (rich context: first real user prompt + timestamps)
+# ---------------------------------------------------------------------------
+
+def _write_codex_rollout_with_records(home: Path, session_id: str, cwd: str, records: list[dict]) -> Path:
+    """Write a codex-style rollout file with arbitrary records."""
+    path = home / ".codex/sessions/2026/08/20"
+    path.mkdir(parents=True, exist_ok=True)
+    fpath = path / f"rollout-2026-08-20T10-00-00-{session_id}.jsonl"
+    fpath.write_text("".join(json.dumps(r) + "\n" for r in records))
+    return fpath
+
+
+def test_summary_extracts_first_real_user_prompt(tmp_path: Path) -> None:
+    sid = "01a014ef-679a-7e53-9129-decaba38336f"
+    _write_codex_rollout_with_records(tmp_path, sid, "/srv/app", [
+        {"timestamp": "2026-08-20T10:00:00Z", "type": "session_meta", "payload": {"id": sid, "cwd": "/srv/app"}},
+        {"timestamp": "2026-08-20T10:01:00Z", "type": "event_msg", "payload": {"role": "user", "content": [{"type": "input_text", "text": "<environment_context>\n  <cwd>/srv/app</cwd>"}]}},
+        {"timestamp": "2026-08-20T10:02:00Z", "type": "event_msg", "payload": {"role": "user", "content": [{"type": "input_text", "text": "fix the login bug"}]}},
+        {"timestamp": "2026-08-20T10:30:00Z", "type": "event_msg", "payload": {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]}},
+    ])
+    sessions = list_sessions(home=lambda: tmp_path)
+    assert len(sessions) == 1
+    r = sessions[0]
+    assert r.summary == "fix the login bug"
+    assert r.first_activity == "2026-08-20T10:00:00Z"
+    assert r.last_activity == "2026-08-20T10:30:00Z"
+    assert r.record_count == 4
+
+
+def test_summary_skips_codex_agent_history_preamble(tmp_path: Path) -> None:
+    sid = "01a014ef-679a-7e53-9129-decaba38336f"
+    _write_codex_rollout_with_records(tmp_path, sid, "/srv/app", [
+        {"timestamp": "2026-08-20T10:00:00Z", "type": "session_meta", "payload": {"id": sid, "cwd": "/srv/app"}},
+        {"timestamp": "2026-08-20T10:01:00Z", "type": "event_msg", "payload": {"role": "user", "content": [{"type": "input_text", "text": "The following is the Codex agent history whose request action you are assessing."}]}},
+        {"timestamp": "2026-08-20T10:02:00Z", "type": "event_msg", "payload": {"role": "user", "content": [{"type": "input_text", "text": "review this PR"}]}},
+    ])
+    sessions = list_sessions(home=lambda: tmp_path)
+    assert sessions[0].summary == "review this PR"
+
+
+def test_summary_extracts_claude_style_nested_message(tmp_path: Path) -> None:
+    """claude nests user text under message.content (list of {type,text})."""
+    sid = "8c9c7be7-0aa4-4d8f-85c5-5cab292766f0"
+    _write_generic_jsonl_session(tmp_path, "claude", sid, "/srv/cl", records=[
+        {"type": "mode", "sessionId": sid, "timestamp": "2026-07-10T07:00:00Z"},
+        {"type": "user", "sessionId": sid, "timestamp": "2026-07-10T07:01:00Z",
+         "message": {"content": [{"type": "text", "text": "build the dashboard"}]}},
+    ])
+    sessions = list_sessions(home=lambda: tmp_path)
+    assert sessions[0].summary == "build the dashboard"
+    assert sessions[0].first_activity == "2026-07-10T07:00:00Z"
+    assert sessions[0].last_activity == "2026-07-10T07:01:00Z"
+
+
+def test_summary_empty_when_no_real_prompt(tmp_path: Path) -> None:
+    """A session with only assistant/metadata records has an empty summary."""
+    sid = "01a014ef-679a-7e53-9129-decaba38336f"
+    _write_codex_rollout_with_records(tmp_path, sid, "/srv/app", [
+        {"timestamp": "2026-08-20T10:00:00Z", "type": "session_meta", "payload": {"id": sid, "cwd": "/srv/app"}},
+        {"timestamp": "2026-08-20T10:01:00Z", "type": "event_msg", "payload": {"role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}},
+    ])
+    sessions = list_sessions(home=lambda: tmp_path)
+    assert sessions[0].summary == ""
+    assert sessions[0].record_count == 2

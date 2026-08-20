@@ -39,7 +39,10 @@ class SessionRecord:
     session_id: str    # the tool's own session identifier
     cwd: str           # absolute working directory the session ran in
     title: str         # human-readable title/summary (may be "")
-    last_activity: str  # ISO-8601 timestamp (or "" if unknown)
+    summary: str       # first real user prompt (truncated) — the richest context
+    first_activity: str  # ISO-8601 timestamp of the first record (or "")
+    last_activity: str   # ISO-8601 timestamp of the last record (or "")
+    record_count: int  # number of records in the session (rough size indicator)
     source_path: str   # path to the store entry (file or db)
 
 
@@ -95,9 +98,7 @@ def _read_codex_sessions(home: Path) -> list[SessionRecord]:
             cwd = cwd[len("file://"):]
         title = str(payload.get("thread_name") or "")
         last_activity = str(meta.get("timestamp") or "")
-        records.append(SessionRecord(
-            "codex", session_id, cwd, title, last_activity, str(path)
-        ))
+        records.append(_make_file_record("codex", session_id, path, cwd, title))
     return records
 
 
@@ -141,9 +142,7 @@ def _read_pi_sessions(home: Path) -> list[SessionRecord]:
             if match is None:
                 continue
             timestamp, session_id = match.group(1), match.group(2)
-            records.append(SessionRecord(
-                "pi", session_id, cwd, "", timestamp, str(path)
-            ))
+            records.append(_make_file_record("pi", session_id, path, cwd, ""))
     return records
 
 
@@ -174,7 +173,10 @@ def _read_opencode_sessions(home: Path) -> list[SessionRecord]:
                 str(row["id"]),
                 str(row["directory"]),
                 str(row["title"] or ""),
+                "",
+                "",
                 str(row["updated_at"] or ""),
+                0,
                 str(db),
             ))
         conn.close()
@@ -217,7 +219,10 @@ def _read_hermes_sessions(home: Path) -> list[SessionRecord]:
                 str(row["cwd"]),
                 str(row["cwd"]),
                 str(row["title"] or ""),
+                "",
+                "",
                 str(row["updated_at"] or ""),
+                0,
                 str(db),
             ))
         conn.close()
@@ -244,6 +249,120 @@ _NON_AGENT_DOTDIRS = {
 }
 # Candidate session files: .jsonl with a UUID in the name, under a hidden dir.
 _SESSION_FILE_RE = re.compile(r".*\.jsonl$", re.I)
+
+# Maximum records to scan when extracting a summary (first user prompt) + the
+# full timestamp span + record count.  200 is enough to find a real user prompt
+# while staying cheap (readline + json on small lines).
+_SUMMARY_SCAN_LIMIT = 200
+# Truncate the summary so the restore UI stays scannable.
+_SUMMARY_MAX_CHARS = 160
+
+
+def _extract_text(value: object) -> str:
+    """Pull a human-readable text string out of a content field (str or list)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("input_text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(parts)
+    return ""
+
+
+def _is_real_prompt(text: str) -> bool:
+    """Heuristic: skip tool-generated context/preamble blocks.
+
+    Skips environment wrappers (``<environment_context``), any other XML-ish
+    tool preambles (leading ``<``), and known codex internal preambles about
+    agent history, so the summary is the first genuine user instruction.
+    """
+    if not text:
+        return False
+    stripped = text.lstrip()
+    if stripped.startswith("<environment_context") or stripped.startswith("<"):
+        return False
+    # codex injects an agent-history preamble on subagent/assess turns.
+    lower = stripped[:80].casefold()
+    if lower.startswith("the following is the codex agent history"):
+        return False
+    if lower.startswith("the following is the"):
+        return False
+    # Skip empty/whitespace or pure-metadata.
+    return len(stripped.strip()) >= 3
+
+
+def _summarize_session_file(path: Path) -> tuple[str, str, str, int]:
+    """Scan a JSONL session file and return (summary, first_ts, last_ts, count).
+
+    The summary is the first real user message.  Works across any agent tool
+    that stores user prompts as JSONL records with a recognizable role/content.
+    """
+    summary = ""
+    first_ts = ""
+    last_ts = ""
+    count = 0
+    try:
+        with path.open("rb") as handle:
+            for _ in range(_SUMMARY_SCAN_LIMIT):
+                line = handle.readline()
+                if not line:
+                    break
+                count += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                ts = record.get("timestamp")
+                if isinstance(ts, str):
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                if not summary:
+                    payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+                    role = payload.get("role") or record.get("role")
+                    # claude-code marks user turns with type=="user" (no role field).
+                    if role is None and record.get("type") == "user":
+                        role = "user"
+                    if role == "user":
+                        # Gather text from payload.content (codex) or
+                        # record.message.content (claude).
+                        text = _extract_text(payload.get("content"))
+                        msg = record.get("message")
+                        if isinstance(msg, dict) and not text:
+                            text = _extract_text(msg.get("content"))
+                        # Skip tool-generated context blocks and keep scanning
+                        # for the first REAL user prompt.
+                        if _is_real_prompt(text):
+                            summary = text[:_SUMMARY_MAX_CHARS]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return summary, first_ts, last_ts, count
+
+
+def _make_file_record(tool: str, session_id: str, path: Path, cwd: str, title: str = "") -> SessionRecord:
+    """Build a SessionRecord from a JSONL session file with rich metadata."""
+    summary, first_ts, last_ts, count = _summarize_session_file(path)
+    return SessionRecord(
+        tool=tool,
+        session_id=session_id,
+        cwd=cwd,
+        title=title,
+        summary=summary,
+        first_activity=first_ts,
+        last_activity=last_ts,
+        record_count=count,
+        source_path=str(path),
+    )
+
 
 
 def _scan_first_record_for_session_cwd(path: Path) -> tuple[str | None, str | None]:
@@ -332,14 +451,7 @@ def _discover_generic_sessions(home: Path) -> list[SessionRecord]:
                     session_id = m.group(0)
             if session_id is None:
                 continue
-            records.append(SessionRecord(
-                tool=tool_name,
-                session_id=session_id,
-                cwd=cwd or "",
-                title="",
-                last_activity="",
-                source_path=str(path),
-            ))
+            records.append(_make_file_record(tool_name, session_id, path, cwd or "", ""))
     return records
 
 
