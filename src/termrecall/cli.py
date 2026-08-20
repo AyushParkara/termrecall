@@ -161,31 +161,28 @@ def _snapshot(client: ServiceClient, stdout: TextIO, stderr: TextIO) -> int:
 
 
 def _resume_display_for_item(item: RecoveryItemView) -> tuple[str, str, int, str]:
-    """Resolve what will actually run for an item, for display only.
+    """Return the server-authoritative resume plan for display.
 
-    Returns (resume_command, summary, session_count, tool_name).  When the
-    stored command is a session-persistent tool, this is the tool's native
-    resume command plus the best-matching session's summary.  Otherwise it
-    falls back to the plain replay command with no session context.
+    Uses the resume_command/resume_summary/resume_session_count the server
+    populated in _recovery_view, so the UI shows exactly what build_attempt will
+    run — no client-side recomputation that could diverge.  Returns
+    (resume_command, summary, session_count, tool_name).  When the item is not
+    a resume-capable tool, resume_command is "" and tool_name is the plain
+    executable for the replay-warning fallback.
     """
+    if item.resume_command:
+        # Tool name is the first token of the resume command.
+        tool = item.resume_command.split(" ", 1)[0] if item.resume_command else ""
+        return item.resume_command, item.resume_summary, item.resume_session_count, tool
+    # No resume plan: plain replayable command.
     command_text = item.replay_display.value if item.replay_display else ""
-    if not command_text:
-        return "", "", 0, ""
-    try:
-        parsed = _parse_one_simple_command(command_text)
-        executable = parsed.executable
-    except ValueError:
-        return command_text, "", 0, ""
-    match = find_resume_adapter(executable)
-    if match is None:
-        # Plain replayable command, no resume.
-        return command_text, "", 0, executable
-    # Find matching sessions for this cwd (most-recent first).
-    matches = find_sessions_for_cwd(str(item.directory))
-    session_id = matches[0].session_id if matches else None
-    summary = matches[0].summary if matches else ""
-    resume_argv = build_resume_argv(match, session_id)
-    return " ".join(resume_argv), summary, len(matches), executable
+    tool = ""
+    if command_text:
+        try:
+            tool = _parse_one_simple_command(command_text).executable
+        except ValueError:
+            tool = ""
+    return command_text, "", 0, tool
 
 
 def _show_item(item: RecoveryItemView, stdout: TextIO) -> None:
@@ -196,20 +193,25 @@ def _show_item(item: RecoveryItemView, stdout: TextIO) -> None:
     if item.directory_warning is not None:
         print(f"    directory warning: {_safe_value(item.directory_warning)}", file=stdout)
     if item.replay_display is not None:
-        resume_command, summary, session_count, tool = _resume_display_for_item(item)
-        if session_count > 0:
+        # The server pre-resolves resume_command/summary/session_count (single
+        # source of truth).  An empty resume_command means this is a plain
+        # replayable command, not a resume-capable tool.
+        resume_command = item.resume_command
+        summary = item.resume_summary
+        session_count = item.resume_session_count
+        if resume_command and session_count > 0:
             # Session-persistent tool: show what will actually run + context.
             print(f"    will resume: {resume_command}", file=stdout)
             if summary:
                 print(f"    session summary: {summary}", file=stdout)
             print(f"    sessions in this directory: {session_count} (most recent selected)", file=stdout)
-        elif resume_command and tool and find_resume_adapter(tool) is not None:
+        elif resume_command:
             # Resume-capable tool but no stored session found yet.
             print(f"    will resume: {resume_command}", file=stdout)
             print("    note: no matching session found; will start fresh", file=stdout)
         else:
             # Plain replayable command (no resume semantics).
-            print(f"    active command: {resume_command or _safe_value(item.replay_display)}", file=stdout)
+            print(f"    active command: {_safe_value(item.replay_display)}", file=stdout)
             print("    warning: this command would be restarted, not resumed", file=stdout)
     elif item.level.value == "partial":
         print("    warning: only the terminal and directory can be restored", file=stdout)
@@ -282,7 +284,9 @@ def _approvals(items: Sequence[RecoveryItemView], selected: set[str], stdin: Tex
         if item.item_id not in selected or not item.replay_eligible or item.replay_display is None:
             continue
         resume_command, summary, session_count, tool = _resume_display_for_item(item)
-        is_resume = bool(tool and find_resume_adapter(tool) is not None)
+        # Server-authoritative: a non-empty resume_command means this item is a
+        # resume-capable tool (no client-side probe needed).
+        is_resume = bool(item.resume_command)
         if is_resume:
             print(f"Restore item {item.item_id}:", file=stdout)
             print(f"  command: {resume_command}", file=stdout)

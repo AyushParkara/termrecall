@@ -277,6 +277,9 @@ class RecoveryItemView:
     directory_warning: SafeExternalText | None
     replay_display: RedactedDisplay | DecodedReplayDisplay | None
     replay_eligible: bool
+    resume_command: str = ""
+    resume_summary: str = ""
+    resume_session_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,9 +632,9 @@ def encode_request(request: ServiceRequest) -> bytes:
 
 def _item(value: object) -> RecoveryItemView:
     if not isinstance(value, dict): raise ValueError("item must be object")
-    keys = {"item_id", "shell_id", "reason", "level", "directory", "directory_warning", "replay_display", "replay_eligible"}; _exact(value, keys, "item")
+    keys = {"item_id", "shell_id", "reason", "level", "directory", "directory_warning", "replay_display", "replay_eligible", "resume_command", "resume_summary", "resume_session_count"}; _exact(value, keys, "item")
     warning = value["directory_warning"]; display = value["replay_display"]
-    return RecoveryItemView(_id(value["item_id"], "item_id"), _id(value["shell_id"], "shell_id", shell=True), _safe_external_text_from_wire(value["reason"], "reason"), _enum(value["level"], RestorationLevel, "level"), _absolute(value["directory"], "directory"), None if warning is None else _safe_external_text_from_wire(warning, "directory_warning"), None if display is None else DecodedReplayDisplay._from_wire(_string(display, "replay_display", MAX_COMMAND_CHARS)), _boolean(value["replay_eligible"], "replay_eligible"))
+    return RecoveryItemView(_id(value["item_id"], "item_id"), _id(value["shell_id"], "shell_id", shell=True), _safe_external_text_from_wire(value["reason"], "reason"), _enum(value["level"], RestorationLevel, "level"), _absolute(value["directory"], "directory"), None if warning is None else _safe_external_text_from_wire(warning, "directory_warning"), None if display is None else DecodedReplayDisplay._from_wire(_string(display, "replay_display", MAX_COMMAND_CHARS)), _boolean(value["replay_eligible"], "replay_eligible"), _string(value.get("resume_command", ""), "resume_command", MAX_COMMAND_CHARS), _string(value.get("resume_summary", ""), "resume_summary", MAX_COMMAND_CHARS), _integer(value.get("resume_session_count", 0), "resume_session_count", 0))
 
 
 def _outcome(value: object) -> OutcomeView:
@@ -702,7 +705,7 @@ def _item_dict(item: RecoveryItemView) -> dict[str, object]:
         raise ValueError("directory_warning lacks safe external provenance")
     if item.replay_display is not None and not isinstance(item.replay_display, RedactedDisplay):
         raise ValueError("replay_display lacks classifier provenance")
-    return {"item_id": item.item_id, "shell_id": item.shell_id, "reason": item.reason.value, "level": item.level.value, "directory": item.directory, "directory_warning": None if item.directory_warning is None else item.directory_warning.value, "replay_display": None if item.replay_display is None else item.replay_display.value, "replay_eligible": item.replay_eligible}
+    return {"item_id": item.item_id, "shell_id": item.shell_id, "reason": item.reason.value, "level": item.level.value, "directory": item.directory, "directory_warning": None if item.directory_warning is None else item.directory_warning.value, "replay_display": None if item.replay_display is None else item.replay_display.value, "replay_eligible": item.replay_eligible, "resume_command": item.resume_command, "resume_summary": item.resume_summary, "resume_session_count": item.resume_session_count}
 
 
 def _outcome_dict(item: OutcomeView) -> dict[str, object]:

@@ -347,32 +347,34 @@ def test_ctrl_c_is_refused_without_request(monkeypatch: pytest.MonkeyPatch) -> N
 # Resume-aware restore UI (real resume command + summary + multi-session picker)
 # ---------------------------------------------------------------------------
 
-def _codex_item(item_id: str = "item-c", cwd: str = "/srv/codex") -> RecoveryItemView:
-    """A recovery item whose stored command is a resume-capable tool (codex)."""
+def _codex_item(item_id: str = "item-c", cwd: str = "/srv/codex", *,
+    resume_command: str = "codex resume --last", resume_summary: str = "", resume_session_count: int = 1,
+) -> RecoveryItemView:
+    """A recovery item whose stored command is a resume-capable tool (codex).
+
+    Carries the server-resolved resume fields (what _recovery_view produces)
+    so the UI reads them directly rather than recomputing client-side.
+    """
     display = type("Display", (), {"value": "codex"})()
-    return RecoveryItemView(item_id, "shell-c", SafeExternalText.catalog("previous_boot"), RestorationLevel.RECONSTRUCTED, cwd, None, display, True)
+    return RecoveryItemView(item_id, "shell-c", SafeExternalText.catalog("previous_boot"), RestorationLevel.RECONSTRUCTED, cwd, None, display, True, resume_command, resume_summary, resume_session_count)
 
 
-def test_show_item_displays_resume_command_not_restart_warning(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Stub the resume/sessions engines so the test is hermetic.
-    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe})() if exe == "codex" else None)
-    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", sid) if sid else ("codex", "resume", "--last"))
-    monkeypatch.setattr(cli, "find_sessions_for_cwd", lambda cwd: [type("S", (), {"session_id": "abc-123", "summary": "fix the login bug", "first_activity": "2026-08-01", "last_activity": "2026-08-02", "title": "", "tool": "codex"})()])
+def test_show_item_displays_resume_command_not_restart_warning() -> None:
+    # The server pre-resolves resume_command + summary; the UI just displays them.
+    item = _codex_item(resume_command="codex resume abc-123", resume_summary="fix the login bug", resume_session_count=1)
     stdout = io.StringIO()
-    cli._show_item(_codex_item(), stdout)
+    cli._show_item(item, stdout)
     out = stdout.getvalue()
     assert "will resume: codex resume abc-123" in out
     assert "session summary: fix the login bug" in out
     assert "sessions in this directory: 1" in out
-    # The misleading old warning must NOT appear for resume-capable tools.
     assert "would be restarted, not resumed" not in out
 
 
-def test_show_item_falls_back_to_replay_warning_for_plain_commands(monkeypatch: pytest.MonkeyPatch) -> None:
-    # python is a non-resume executable; the old replay warning should show.
-    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: None)
+def test_show_item_falls_back_to_replay_warning_for_plain_commands() -> None:
+    # A plain (non-resume) command: server leaves resume_command empty.
     display = type("Display", (), {"value": "python app.py"})()
-    item = RecoveryItemView("item-d", "shell-d", SafeExternalText.catalog("previous_boot"), RestorationLevel.RECONSTRUCTED, "/srv", None, display, True)
+    item = RecoveryItemView("item-d", "shell-d", SafeExternalText.catalog("previous_boot"), RestorationLevel.RECONSTRUCTED, "/srv", None, display, True, "", "", 0)
     stdout = io.StringIO()
     cli._show_item(item, stdout)
     out = stdout.getvalue()
@@ -381,10 +383,10 @@ def test_show_item_falls_back_to_replay_warning_for_plain_commands(monkeypatch: 
 
 
 def test_approvals_resume_defaults_to_yes_on_enter(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe})() if exe == "codex" else None)
-    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", "--last"))
+    # Server resolved resume_command; picker only needs find_sessions_for_cwd
+    # when session_count > 1, so stub it for the picker (empty here).
     monkeypatch.setattr(cli, "find_sessions_for_cwd", lambda cwd: [])
-    item = _codex_item()
+    item = _codex_item(resume_command="codex resume --last", resume_session_count=0)
     stdin = io.StringIO("\n")  # Enter = default yes
     stdout = io.StringIO()
     approved = cli._approvals((item,), {item.item_id}, stdin, stdout, directory_only=False)
@@ -393,15 +395,14 @@ def test_approvals_resume_defaults_to_yes_on_enter(monkeypatch: pytest.MonkeyPat
 
 
 def test_approvals_multi_session_picker_shows_summary(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe})() if exe == "codex" else None)
-    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", sid))
     sessions = [
         type("S", (), {"session_id": "sess-1", "summary": "", "first_activity": "2026-08-01", "last_activity": "2026-08-01", "title": "", "tool": "codex"}),
         type("S", (), {"session_id": "sess-2", "summary": "build the dashboard", "first_activity": "2026-07-01", "last_activity": "2026-07-05", "title": "", "tool": "codex"}),
     ]
     monkeypatch.setattr(cli, "find_sessions_for_cwd", lambda cwd: sessions)
-    item = _codex_item()
-    # Pick session 2 (the one with a summary), then approve with Enter.
+    monkeypatch.setattr(cli, "build_resume_argv", lambda m, sid: ("codex", "resume", sid))
+    monkeypatch.setattr(cli, "find_resume_adapter", lambda exe: type("M", (), {"executable": exe, "contract": type("C",(),{"build":staticmethod(lambda self,exe,sid:("codex","resume",sid))})()})() if exe == "codex" else None)
+    item = _codex_item(resume_command="codex resume sess-1", resume_session_count=2)
     stdin = io.StringIO("2\n\n")
     stdout = io.StringIO()
     approved = cli._approvals((item,), {item.item_id}, stdin, stdout, directory_only=False)

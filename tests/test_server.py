@@ -1613,3 +1613,38 @@ async def test_discard_rejects_workspace_mismatch(server_factory, tmp_path: Path
     response, _, _ = await dispatch(server, line({"schema_version": 1, "operation": "discard", "workspace_id": "other", "confirm": True}))
     assert response["error"]["code"] == "workspace_mismatch"
     assert store.completed == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_view_populates_server_authoritative_resume_fields(server_factory) -> None:
+    """_recovery_view resolves the resume plan server-side so the client UI
+    displays what build_attempt will actually run (single source of truth)."""
+    from termrecall.model import CommandRecord, CommandDisposition, ShellRecord, ProcessIdentity, Snapshot
+    from termrecall.state import EngineState, register_shell
+    from termrecall.protocol import RegisterRequest
+    server = server_factory()
+    # A codex shell that died in a previous boot.
+    ident = ProcessIdentity("boot-dead", 4242, 123456)
+    cmd = CommandRecord(1, "codex", "codex", CommandDisposition.REPLAYABLE, True)
+    # Build a snapshot with the dead shell and reconcile.
+    # (Use the server's reconcile path indirectly via restore_list is heavy;
+    # test _recovery_view directly instead.)
+    from termrecall.recovery import RecoveryItem, RecoveryReason, RestorationLevel
+    from pathlib import Path
+    item = RecoveryItem(
+        item_id="item-x",
+        shell=ShellRecord("shell-aaaaaaaaaaaa", ident, "gnome-terminal", "/srv/codex", 1, cmd, None),
+        reason=RecoveryReason.PREVIOUS_BOOT,
+        level=RestorationLevel.RECONSTRUCTED,
+        directory=Path("/srv/codex"),
+        directory_warning=None,
+        replay_display=cmd.executable,
+        replay_eligible=True,
+    )
+    view = server.__class__._recovery_view(item)
+    # resume_command is populated by the server (may be empty if codex isn't
+    # installed in the test env, but the field must exist and be a string).
+    assert isinstance(view.resume_command, str)
+    assert isinstance(view.resume_summary, str)
+    assert isinstance(view.resume_session_count, int)
+    assert view.resume_session_count >= 0

@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from termrecall.adapters.base import TerminalAdapter
+from termrecall.adapters.resume import build_resume_argv, find_resume_adapter
+from termrecall.classifier import _parse_one_simple_command
+from termrecall.sessions import find_active_session_id, find_sessions_for_cwd
 from termrecall.model import MAX_OUTCOME_MESSAGE_CHARS, Outcome, OutcomeKind, RestorationLevel
 from termrecall.paths import read_boot_id
 from termrecall.processes import ProcessProbe, identity_status
@@ -749,6 +752,36 @@ class TermRecallServer:
         display = None
         if command is not None and item.replay_eligible:
             display = RedactedDisplay.from_command_record(command)
+        # Resolve the resume plan server-side (single source of truth) so the
+        # client UI displays what will actually run, not a client-recomputed
+        # guess.  Empty when the stored command is not a resume-capable tool.
+        resume_command = ""
+        resume_summary = ""
+        resume_session_count = 0
+        if command is not None and command.active and command.executable:
+            try:
+                parsed = _parse_one_simple_command(command.executable)
+                executable = parsed.executable
+            except ValueError:
+                executable = ""
+            match = find_resume_adapter(executable) if executable else None
+            if match is not None:
+                cwd = str(item.directory) if item.directory else str(item.shell.cwd)
+                try:
+                    session_id = find_active_session_id(executable)
+                    matches = find_sessions_for_cwd(cwd)
+                    if session_id is None and matches:
+                        session_id = matches[0].session_id
+                    if matches:
+                        resume_summary = matches[0].summary
+                        resume_session_count = len(matches)
+                except (OSError, ValueError, KeyError):
+                    session_id = None
+                try:
+                    resume_argv = build_resume_argv(match, session_id)
+                    resume_command = " ".join(resume_argv)
+                except ValueError:
+                    resume_command = ""
         return RecoveryItemView(
             item.item_id,
             item.shell.shell_id,
@@ -758,6 +791,9 @@ class TermRecallServer:
             None if item.directory_warning is None else SafeExternalText.sanitize(item.directory_warning),
             display,
             item.replay_eligible,
+            resume_command,
+            resume_summary,
+            resume_session_count,
         )
 
     @staticmethod
