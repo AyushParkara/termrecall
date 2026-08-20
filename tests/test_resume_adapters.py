@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+import termrecall.sessions
 from termrecall.adapters.resume import (
     ResumeContract,
     ResumeMatch,
@@ -98,6 +99,10 @@ def test_non_session_tools_are_rejected(exe, monkeypatch):
 def test_resume_works_even_when_launch_was_unsafe(monkeypatch):
     monkeypatch.setattr("termrecall.adapters.resume._probe_help_output", _probe)
     monkeypatch.setattr("termrecall.adapters.resume.shutil.which", _resolver)
+    # Isolate the session-store lookup so no real session id is resolved and
+    # the resume falls back to the cwd-only form.
+    monkeypatch.setattr("termrecall.sessions.find_active_session_id", lambda tool: None)
+    monkeypatch.setattr("termrecall.sessions.find_sessions_for_cwd", lambda *a, **k: [])
     command = CommandRecord(1, "codex --yolo", None, CommandDisposition.UNSAFE, True)
     record = RecoveryRecord(1, "ws", 7, 13.5,
         (RecoveryItemRecord("item", _shell("/srv", command), "previous_boot"),), (), ())

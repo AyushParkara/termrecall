@@ -296,7 +296,20 @@ def build_attempt(
                     executable_name = None
             resume_adapter = find_resume_adapter(executable_name) if executable_name else None
             if resume_adapter is not None:
-                resume_argv = build_resume_argv(resume_adapter, None)
+                # Resolve the exact session id for deterministic resume: prefer
+                # a live env var (e.g. CODEX_SESSION_ID for the current process),
+                # then fall back to the most-recent session the tool recorded in
+                # this cwd (handles the multi-session case deterministically).
+                session_id: str | None = None
+                try:
+                    from termrecall.sessions import find_active_session_id, find_sessions_for_cwd
+                    session_id = find_active_session_id(resume_adapter.executable)
+                    if session_id is None:
+                        matches = find_sessions_for_cwd(str(directory) if directory else str(Path(stored.shell.cwd)))
+                        session_id = matches[0].session_id if matches else None
+                except Exception:
+                    session_id = None
+                resume_argv = build_resume_argv(resume_adapter, session_id)
                 resume_executable = resume_argv[0] if resume_argv else None
                 if resume_executable and executable_resolver(resume_executable) is None:
                     missing_executable.add(item_id)
