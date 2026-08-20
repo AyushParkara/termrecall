@@ -128,7 +128,16 @@ def _slug_to_path(slug: str) -> str:
 
 
 def _read_pi_sessions(home: Path) -> list[SessionRecord]:
-    """Read pi session directories (cwd-keyed) and extract UUIDs from filenames."""
+    """Read pi session directories and extract UUIDs + the REAL cwd.
+
+    pi stores sessions under ``~/.pi/agent/sessions/<cwd-slug>/`` where the slug
+    collapses both ``/`` and ``_`` to ``-`` — so the slug is AMBIGUOUS (the dir
+    ``ideas_to_practical_implementation`` and ``ideas/to/practical/implementation``
+    produce the same slug).  We therefore never decode the slug back to a path;
+    instead we read the authoritative cwd from inside each session file (pi
+    records the real cwd in the first record), falling back to the filename UUID
+    only when the file has no parseable cwd.
+    """
     root = home / _PI_SESSIONS_DIR
     records: list[SessionRecord] = []
     if not root.is_dir():
@@ -136,13 +145,27 @@ def _read_pi_sessions(home: Path) -> list[SessionRecord]:
     for session_dir in root.iterdir():
         if not session_dir.is_dir():
             continue
-        cwd = _slug_to_path(session_dir.name)
         for path in session_dir.iterdir():
             match = _PI_SESSION_RE.search(path.name)
             if match is None:
                 continue
-            timestamp, session_id = match.group(1), match.group(2)
-            records.append(_make_file_record("pi", session_id, path, cwd, ""))
+            # Single-pass scan reads id+cwd+summary from the file content. The
+            # filename's timestamp+uuid give us the session id as a fallback.
+            session_id_file = match.group(2)
+            session_id, cwd, summary, first_ts, last_ts, count = _scan_session_full(path)
+            if session_id is None:
+                session_id = session_id_file
+            # pi's cwd is reliably encoded in the directory slug when the file
+            # itself carries no cwd record.  The slug is ambiguous (_ and /
+            # both become -), so prefer the file's cwd; fall back to the slug
+            # only when the file has none.
+            if not cwd:
+                cwd = _slug_to_path(session_dir.name)
+            records.append(SessionRecord(
+                tool="pi", session_id=session_id, cwd=cwd or "",
+                title="", summary=summary, first_activity=first_ts,
+                last_activity=last_ts, record_count=count, source_path=str(path),
+            ))
     return records
 
 

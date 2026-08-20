@@ -52,3 +52,30 @@ class TerminalAdapter(Protocol):
     def execute(
         self, actions: Sequence[LaunchAction], attempt_id: str
     ) -> Sequence[Outcome]: ...
+
+
+# ---------------------------------------------------------------------------
+# Multi-tab grouping helpers
+# ---------------------------------------------------------------------------
+
+# Per-tab terminal options built by adapters.  ``--window-token`` and
+# ``--tab-token`` are the argv tokens that begin a new window / tab for the
+# terminal (e.g. ("--window",) for gnome/xfce4, () for kitty/ghostty which use
+# a session file).  ``tab_options(item)`` returns the per-tab argv (working-dir
+# + command) so a single grouped launch emits one window with N tabs.
+import shlex
+
+
+def _tab_argv_for(item: LaunchItem, *, wrapper: str, wrapper_args: tuple[str, ...]) -> tuple[str, ...]:
+    """Build the per-tab argv fragment for one LaunchItem.
+
+    Emits ``bash -c <wrapper> bash <cmd tokens>`` so the approved command runs
+    directly via ``exec "$@"``.  Returns an empty tuple when the cwd is unusable
+    (the adapter marks the item UNAVAILABLE instead).
+    """
+    if not item.cwd.is_absolute() or not item.cwd.is_dir():
+        return ()
+    argv: list[str] = []
+    if item.approved_command is not None:
+        argv += ("bash", "-c", wrapper, *wrapper_args, *shlex.split(item.approved_command))
+    return tuple(argv)

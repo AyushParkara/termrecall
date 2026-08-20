@@ -38,24 +38,34 @@ def test_detect_uses_injected_executable_resolver() -> None:
     assert not KonsoleAdapter(lambda _: None).detect()
 
 
-def test_capabilities_do_not_claim_deferred_features() -> None:
+def test_capabilities_claim_grouping_supported() -> None:
     caps = adapter_with_executable().capabilities()
     assert caps.tabs and caps.directories and caps.command_launch
-    assert not caps.windows
-    assert not caps.panes
-    assert not caps.scrollback
-    assert not caps.deterministic_grouping
+    assert caps.deterministic_grouping is True
 
 
-def test_interactive_plan_uses_argv_without_a_shell(tmp_path: Path) -> None:
-    action = adapter_with_executable().plan(
+def test_interactive_plan_groups_into_single_window(tmp_path: Path) -> None:
+    actions = adapter_with_executable().plan(
         [LaunchItem("item-a", tmp_path, None)]
-    )[0]
-
+    )
+    assert len(actions) == 1
+    action = actions[0]
     assert action.item_ids == ("item-a",)
     assert action.argv == (EXECUTABLE, "--workdir", str(tmp_path))
     assert action.level is RestorationLevel.PARTIAL
-    assert action.warnings == ("grouping unsupported",)
+    assert action.warnings == ()
+
+
+def test_interactive_plan_groups_multiple_items_with_new_tab(tmp_path: Path) -> None:
+    actions = adapter_with_executable().plan(
+        [LaunchItem("a", tmp_path, None), LaunchItem("b", tmp_path, None)]
+    )
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.item_ids == ("a", "b")
+    # First item: --workdir; second item: --new-tab --workdir
+    assert action.argv.count("--new-tab") == 1
+    assert action.argv.count("--workdir") == 2
 
 
 def test_approved_command_is_positional_data_in_fixed_wrapper(tmp_path: Path) -> None:
@@ -64,6 +74,7 @@ def test_approved_command_is_positional_data_in_fixed_wrapper(tmp_path: Path) ->
         [LaunchItem("item-a", tmp_path, command)]
     )[0]
 
+    assert action.item_ids == ("item-a",)
     assert action.argv == (
         EXECUTABLE,
         "--workdir",
@@ -79,37 +90,36 @@ def test_approved_command_is_positional_data_in_fixed_wrapper(tmp_path: Path) ->
         "printf",
         "done",
     )
-    # The approved command is never interpolated into the wrapper script; its
-    # tokens are passed as positional argv that ``exec "$@"`` runs directly.
     assert command not in WRAPPER
     assert "bash -lc" not in WRAPPER
     assert action.level is RestorationLevel.RECONSTRUCTED
 
 
-def test_distinct_commands_use_independent_launch_actions(tmp_path: Path) -> None:
+def test_distinct_commands_grouped_into_single_window(tmp_path: Path) -> None:
     actions = adapter_with_executable().plan(
         [
             LaunchItem("a", tmp_path, "python3 -m http.server"),
             LaunchItem("b", tmp_path, "npm run dev"),
         ]
     )
-    assert len(actions) == 2
-    assert [action.item_ids for action in actions] == [("a",), ("b",)]
-    assert all("grouping unsupported" in action.warnings for action in actions)
+    assert len(actions) == 1
+    assert actions[0].item_ids == ("a", "b")
+    assert "grouping unsupported" not in str(actions[0].warnings)
 
 
 @pytest.mark.parametrize("cwd", [Path("relative"), Path("/definitely/missing/task-11")])
-def test_plan_rejects_non_absolute_or_missing_directory(cwd: Path) -> None:
-    with pytest.raises(ValueError, match="cwd must be an absolute existing directory"):
-        adapter_with_executable().plan([LaunchItem("item-a", cwd, None)])
+def test_plan_skips_non_absolute_or_missing_directory(cwd: Path) -> None:
+    # Grouped restore skips bad cwds (marking them UNAVAILABLE) instead of
+    # aborting the whole window when one folder is missing.
+    actions = adapter_with_executable().plan([LaunchItem("item-a", cwd, None)])
+    assert actions[0].level is RestorationLevel.UNAVAILABLE
 
 
-def test_plan_rejects_file_as_directory(tmp_path: Path) -> None:
+def test_plan_skips_file_as_directory(tmp_path: Path) -> None:
     file_path = tmp_path / "not-a-directory"
     file_path.write_text("data")
-
-    with pytest.raises(ValueError, match="cwd must be an absolute existing directory"):
-        adapter_with_executable().plan([LaunchItem("item-a", file_path, None)])
+    actions = adapter_with_executable().plan([LaunchItem("item-a", file_path, None)])
+    assert actions[0].level is RestorationLevel.UNAVAILABLE
 
 
 def test_missing_terminal_executable_plans_unavailable_without_argv(

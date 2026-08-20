@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import shlex
+
+
+def _shell_escape(token: str) -> str:
+    return "'" + token.replace("'", "'\\''") + "'"
+
 import subprocess
 from collections.abc import Callable, Sequence
 
@@ -50,48 +55,53 @@ class KittyAdapter:
             panes=False,
             scrollback=False,
             command_launch=True,
-            deterministic_grouping=False,
+            deterministic_grouping=True,
         )
 
     def plan(self, items: Sequence[LaunchItem]) -> Sequence[LaunchAction]:
         executable = self._which("kitty")
-        actions: list[LaunchAction] = []
+        if executable is None:
+            return tuple(
+                LaunchAction((item.item_id,), (), RestorationLevel.UNAVAILABLE, (_UNAVAILABLE_WARNING,))
+                for item in items
+            )
+        # Group all items into ONE kitty window with N tabs via a session file.
+        # kitty session format: each ``new_tab`` opens a tab in the window;
+        # ``cd`` sets the tab's cwd; ``launch`` runs the command.
+        import os, tempfile
+        item_ids: list[str] = []
+        levels: set[RestorationLevel] = set()
+        missing: list[str] = []
+        lines: list[str] = []
         for item in items:
             if not item.cwd.is_absolute() or not item.cwd.is_dir():
-                raise ValueError("cwd must be an absolute existing directory")
-            if executable is None:
-                actions.append(
-                    LaunchAction(
-                        (item.item_id,),
-                        (),
-                        RestorationLevel.UNAVAILABLE,
-                        (_UNAVAILABLE_WARNING,),
-                    )
-                )
+                missing.append(item.item_id)
                 continue
-
-            argv: tuple[str, ...] = (
-                executable,
-                "--directory",
-                str(item.cwd),
-            )
-            level = RestorationLevel.PARTIAL
+            lines.append("new_tab")
+            lines.append(f"cd {item.cwd}")
             if item.approved_command is not None:
-                argv += (
-                    "--hold",
-                    "bash",
-                    "-c",
-                    _COMMAND_WRAPPER,
-                    "bash",
-                    *shlex.split(item.approved_command),
-                )
-                level = RestorationLevel.RECONSTRUCTED
-            actions.append(
-                LaunchAction(
-                    (item.item_id,), argv, level, (_GROUPING_WARNING,)
-                )
+                cmd = " ".join(_shell_escape(t) for t in shlex.split(item.approved_command))
+                lines.append(f"launch bash -c {_COMMAND_WRAPPER!r} bash {cmd}")
+                levels.add(RestorationLevel.RECONSTRUCTED)
+            else:
+                levels.add(RestorationLevel.PARTIAL)
+            item_ids.append(item.item_id)
+        if not item_ids:
+            return tuple(
+                LaunchAction((iid,), (), RestorationLevel.UNAVAILABLE, (_UNAVAILABLE_WARNING,))
+                for iid in (missing or [i.item_id for i in items])
             )
-        return tuple(actions)
+        fd, session_path = tempfile.mkstemp(prefix="termrecall-kitty-", suffix=".session")
+        with os.fdopen(fd, "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+        level = (
+            RestorationLevel.RECONSTRUCTED if RestorationLevel.RECONSTRUCTED in levels
+            else RestorationLevel.PARTIAL if RestorationLevel.PARTIAL in levels
+            else RestorationLevel.UNAVAILABLE
+        )
+        warnings = () if not missing else tuple(f"{iid}: directory unavailable" for iid in missing)
+        argv = (executable, "--session", session_path)
+        return (LaunchAction(tuple(item_ids), argv, level, warnings),)
 
     def execute(
         self, actions: Sequence[LaunchAction], attempt_id: str

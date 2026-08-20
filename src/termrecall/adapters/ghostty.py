@@ -49,48 +49,43 @@ class GhosttyAdapter:
             panes=False,
             scrollback=False,
             command_launch=True,
-            deterministic_grouping=False,
+            deterministic_grouping=True,
         )
 
     def plan(self, items: Sequence[LaunchItem]) -> Sequence[LaunchAction]:
         executable = self._which("ghostty")
-        actions: list[LaunchAction] = []
-        for item in items:
+        if executable is None:
+            return tuple(
+                LaunchAction((item.item_id,), (), RestorationLevel.UNAVAILABLE, (_UNAVAILABLE_WARNING,))
+                for item in items
+            )
+        item_ids: list[str] = []
+        argv: list[str] = [executable]
+        levels: set[RestorationLevel] = set()
+        missing: list[str] = []
+        for index, item in enumerate(items):
             if not item.cwd.is_absolute() or not item.cwd.is_dir():
-                raise ValueError("cwd must be an absolute existing directory")
-            if executable is None:
-                actions.append(
-                    LaunchAction(
-                        (item.item_id,),
-                        (),
-                        RestorationLevel.UNAVAILABLE,
-                        (_UNAVAILABLE_WARNING,),
-                    )
-                )
+                missing.append(item.item_id)
                 continue
-
-            argv: tuple[str, ...] = (
-                executable,
-                f"--working-directory={item.cwd}",
-            )
-            level = RestorationLevel.PARTIAL
+            argv.append(f"--working-directory={item.cwd}")
             if item.approved_command is not None:
-                argv += (
-                    "-e",
-                    "bash",
-                    "-c",
-                    _COMMAND_WRAPPER,
-                    "bash",
-                    *shlex.split(item.approved_command),
-                )
-                level = RestorationLevel.RECONSTRUCTED
-            actions.append(
-                LaunchAction(
-                    (item.item_id,), argv, level, (_GROUPING_WARNING,)
-                )
+                argv += ("-e", "bash", "-c", _COMMAND_WRAPPER, "bash", *shlex.split(item.approved_command))
+                levels.add(RestorationLevel.RECONSTRUCTED)
+            else:
+                levels.add(RestorationLevel.PARTIAL)
+            item_ids.append(item.item_id)
+        if not item_ids:
+            return tuple(
+                LaunchAction((iid,), (), RestorationLevel.UNAVAILABLE, (_UNAVAILABLE_WARNING,))
+                for iid in (missing or [i.item_id for i in items])
             )
-        return tuple(actions)
-
+        level = (
+            RestorationLevel.RECONSTRUCTED if RestorationLevel.RECONSTRUCTED in levels
+            else RestorationLevel.PARTIAL if RestorationLevel.PARTIAL in levels
+            else RestorationLevel.UNAVAILABLE
+        )
+        warnings = (_GROUPING_WARNING,) if len(item_ids) > 1 else (() if not missing else tuple(f"{iid}: directory unavailable" for iid in missing))
+        return (LaunchAction(tuple(item_ids), tuple(argv), level, warnings),)
     def execute(
         self, actions: Sequence[LaunchAction], attempt_id: str
     ) -> Sequence[Outcome]:

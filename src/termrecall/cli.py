@@ -292,7 +292,10 @@ def _approvals(items: Sequence[RecoveryItemView], selected: set[str], stdin: Tex
             print(f"  command: {resume_command}", file=stdout)
             # If multiple sessions match this cwd, offer a picker so the user
             # can choose which historical session to resume.
-            matches = find_sessions_for_cwd(str(item.directory)) if session_count > 1 else []
+            # Filter by tool so the picker count matches the server-side
+            # count (which counts only this tool sessions in the cwd).
+            tool_name = resume_command.split(" ", 1)[0] if resume_command else ""
+            matches = [m for m in find_sessions_for_cwd(str(item.directory)) if m.tool == tool_name] if session_count > 1 else []
             if len(matches) > 1:
                 print(f"  {len(matches)} sessions found in {item.directory}:", file=stdout)
                 for idx, m in enumerate(matches, 1):
