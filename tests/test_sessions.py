@@ -157,3 +157,83 @@ def test_readers_handle_corrupt_file_gracefully(tmp_path: Path) -> None:
     path.mkdir(parents=True)
     (path / "rollout-2026-08-20T10-00-00-01a014ef-679a-7e53-9129-decaba38336f.jsonl").write_text("not json\n")
     assert _read_codex_sessions(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Generic discovery (auto-detects unknown agent tools)
+# ---------------------------------------------------------------------------
+
+def _write_generic_jsonl_session(home: Path, tool: str, session_id: str, cwd: str, *, records: list[dict] | None = None) -> Path:
+    """Write a session file for a fake tool in ~/.<tool>/sessions/."""
+    sdir = home / f".{tool}" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    fpath = sdir / f"{session_id}.jsonl"
+    lines = records if records is not None else [
+        {"type": "mode", "sessionId": session_id},
+        {"type": "user", "cwd": cwd, "text": "hi"},
+    ]
+    fpath.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    return fpath
+
+
+def test_generic_discovery_detects_unknown_tool(tmp_path: Path) -> None:
+    """A tool TermRecall has never heard of (deepseek) is auto-detected."""
+    _write_generic_jsonl_session(tmp_path, "deepseek", "0a73a2fd-0351-7c92-9a3f-1a2b3c4d5e6f", "/srv/ds")
+    sessions = list_sessions(home=lambda: tmp_path)
+    ds = [r for r in sessions if r.tool == "deepseek"]
+    assert len(ds) == 1
+    assert ds[0].session_id == "0a73a2fd-0351-7c92-9a3f-1a2b3c4d5e6f"
+    assert ds[0].cwd == "/srv/ds"
+
+
+def test_generic_discovery_extracts_cwd_from_later_record(tmp_path: Path) -> None:
+    """claude-code puts mode markers first; cwd appears on a later record."""
+    sid = "0a73a2fd-0351-7c92-9a3f-1a2b3c4d5e6f"
+    _write_generic_jsonl_session(tmp_path, "claude", sid, "/srv/cl", records=[
+        {"type": "last-prompt", "leafUuid": "x", "sessionId": sid},
+        {"type": "mode", "mode": "normal", "sessionId": sid},
+        {"type": "permission-mode", "permissionMode": "auto", "sessionId": sid},
+        {"type": "user", "cwd": "/srv/cl", "text": "hello"},
+    ])
+    sessions = list_sessions(home=lambda: tmp_path)
+    cl = [r for r in sessions if r.tool == "claude"]
+    assert len(cl) == 1
+    assert cl[0].cwd == "/srv/cl"
+
+
+def test_generic_discovery_normalizes_file_uri_cwd(tmp_path: Path) -> None:
+    sid = "0a73a2fd-0351-7c92-9a3f-1a2b3c4d5e6f"
+    _write_generic_jsonl_session(tmp_path, "myagent", sid, "ignored", records=[
+        {"sessionId": sid, "cwd": "file:///srv/uri"},
+    ])
+    sessions = list_sessions(home=lambda: tmp_path)
+    assert sessions[0].cwd == "/srv/uri"
+
+
+def test_generic_discovery_falls_back_to_filename_uuid(tmp_path: Path) -> None:
+    """A session file with no parseable id-in-record still yields the filename UUID."""
+    sid = "0a73a2fd-0351-7c92-9a3f-1a2b3c4d5e6f"
+    sdir = tmp_path / ".futureagent" / "sessions"
+    sdir.mkdir(parents=True)
+    (sdir / f"{sid}.jsonl").write_text("not json at all\n")
+    sessions = list_sessions(home=lambda: tmp_path)
+    fa = [r for r in sessions if r.tool == "futureagent"]
+    assert len(fa) == 1
+    assert fa[0].session_id == sid
+
+
+def test_generic_discovery_skips_non_agent_dotdirs(tmp_path: Path) -> None:
+    """~/.cache etc. are not scanned for sessions."""
+    (tmp_path / ".cache" / "sub").mkdir(parents=True)
+    (tmp_path / ".cache" / "sub" / "0a73a2fd-0351-7c92-9a3f-1a2b3c4d5e6f.jsonl").write_text("{}\n")
+    assert list_sessions(home=lambda: tmp_path) == []
+
+
+def test_generic_discovery_dedups_with_explicit_readers(tmp_path: Path, monkeypatch) -> None:
+    """If a tool has both an explicit reader and generic files, no duplicates."""
+    # codex rollout (explicit reader)
+    _write_codex_rollout(tmp_path, "01a014ef-679a-7e53-9129-decaba38336f", "/srv/app")
+    sessions = list_sessions(home=lambda: tmp_path)
+    codex = [r for r in sessions if r.tool == "codex"]
+    # Each session appears exactly once.
+    assert len(codex) == len({r.session_id for r in codex})

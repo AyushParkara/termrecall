@@ -227,6 +227,123 @@ def _read_hermes_sessions(home: Path) -> list[SessionRecord]:
 
 
 # ---------------------------------------------------------------------------
+# Generic discovery engine (auto-detects unknown agent tools)
+# ---------------------------------------------------------------------------
+
+# Pattern for a session-id-bearing filename: a UUID (v1-v8) anywhere in it.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
+# Directories under ~ that are NOT agent session stores even if they look like one.
+_NON_AGENT_DOTDIRS = {
+    ".cache", ".config", ".local", ".gnupg", ".ssh", ".bashrc",
+    ".mozilla", ".thunderbird", ".steam", ".wine", ".npm", ".cargo",
+    ".rustup", ".nvm", ".pyenv", ".rbenv", ".gradle", ".android", ".java",
+    ".docker", ".vscode", ".idea", ".git", ".pip", ".conda", ".virtualenvs",
+    ".fontconfig", ".pki", ".local/share", ".local/state",
+}
+# Candidate session files: .jsonl with a UUID in the name, under a hidden dir.
+_SESSION_FILE_RE = re.compile(r".*\.jsonl$", re.I)
+
+
+def _scan_first_record_for_session_cwd(path: Path) -> tuple[str | None, str | None]:
+    """Read the first JSON line of a session file; return (session_id, cwd).
+
+    Looks for common field names across agent tools: sessionId, session_id, id
+    (in a meta record), and cwd/directory/workdir.  Returns (None, None) if the
+    file isn't parseable or carries no usable fields.
+    """
+    session_id: str | None = None
+    cwd: str | None = None
+    try:
+        with path.open("rb") as handle:
+            # Scan up to 30 records so a cwd appearing later than the id (as in
+            # claude-code, whose first records are mode/permission markers) is
+            # still captured. Cheap: readline + json on small lines.
+            for _ in range(30):
+                line = handle.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+                for key in ("sessionId", "session_id", "id"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and _UUID_RE.fullmatch(value):
+                        session_id = session_id or value
+                nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                if isinstance(nested.get("id"), str) and _UUID_RE.fullmatch(nested["id"]):
+                    session_id = session_id or nested["id"]
+                for key in ("cwd", "directory", "workdir", "project_path"):
+                    value = payload.get(key)
+                    if isinstance(value, str):
+                        if value.startswith("file://"):
+                            value = value[len("file://"):]
+                        if value.startswith("/"):
+                            cwd = cwd or value
+                if session_id and cwd:
+                    return session_id, cwd
+    except (OSError, json.JSONDecodeError):
+        pass
+    return session_id, cwd
+
+
+def _discover_generic_sessions(home: Path) -> list[SessionRecord]:
+    """Auto-detect session stores for any agent tool under ~.
+
+    Scans hidden directories (~/.<tool>/) for .jsonl files containing a UUID
+    session id, reading the cwd from inside each file's first records.  This
+    discovers tools TermRecall has never heard of (claude-code, deepseek,
+    gemini-cli, aider, etc.) as long as they store sessions as JSONL with an
+    embedded session id and cwd.  No per-tool code is required.
+    """
+    records: list[SessionRecord] = []
+    for dotdir in home.iterdir():
+        if not dotdir.is_dir() or not dotdir.name.startswith("."):
+            continue
+        if dotdir.name in _NON_AGENT_DOTDIRS:
+            continue
+        tool_name = dotdir.name[1:]  # strip leading "."
+        # Skip very large dirs (avoid scanning .cache/.local subtrees that
+        # slipped past the allowlist) and non-agent dirs.
+        try:
+            session_files = list(dotdir.rglob("*.jsonl"))
+        except OSError:
+            continue
+        # Limit to avoid pathological dirs; session stores are small.
+        if len(session_files) > 2000:
+            continue
+        for path in session_files:
+            # Require a UUID in the filename or path (session-id-bearing file).
+            if not _UUID_RE.search(str(path)):
+                continue
+            session_id, cwd = _scan_first_record_for_session_cwd(path)
+            if session_id is None:
+                # Fall back to the UUID in the filename.
+                m = _UUID_RE.search(path.name)
+                if m:
+                    session_id = m.group(0)
+            if session_id is None:
+                continue
+            records.append(SessionRecord(
+                tool=tool_name,
+                session_id=session_id,
+                cwd=cwd or "",
+                title="",
+                last_activity="",
+                source_path=str(path),
+            ))
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -245,16 +362,32 @@ def list_sessions(
 ) -> list[SessionRecord]:
     """Enumerate sessions across all supported tools (or one tool).
 
-    Returns every session discovered in the tool(s)' on-disk store.  No
-    subprocess is spawned; this is a pure read of files/SQLite.
+    Combines the explicit per-tool readers (codex, pi, opencode, hermes) with
+    a generic discovery pass that auto-detects ANY agent tool under the home
+    directory (claude-code, deepseek, gemini-cli, aider, ...) by scanning for
+    session-id-bearing JSONL files.  No subprocess is spawned; this is a pure
+    read of files/SQLite.
     """
     home_path = home()
     tools = [tool] if tool else list(_READERS)
     records: list[SessionRecord] = []
+    seen: set[tuple[str, str]] = set()
     for name in tools:
         reader = _READERS.get(name)
         if reader is not None:
-            records.extend(reader(home_path))
+            for record in reader(home_path):
+                key = (record.tool, record.session_id)
+                if key not in seen:
+                    seen.add(key)
+                    records.append(record)
+    # Generic discovery: only run when not filtered to a single known tool, so
+    # unknown tools (claude, deepseek, gemini, aider, ...) are auto-detected.
+    if tool is None:
+        for record in _discover_generic_sessions(home_path):
+            key = (record.tool, record.session_id)
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
     return records
 
 
