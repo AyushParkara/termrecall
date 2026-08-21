@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--retry", metavar="ATTEMPT", help="retry an incomplete attempt")
     restore.add_argument("--directory-only", action="store_true", help="never rerun commands")
     restore.add_argument("--backend", choices=("auto", "capture", "timestamp"), default="auto",
-        help="session source: auto (capture then timestamp fallback), capture (background server), timestamp (tools stores only)")
+        help="session source: auto = background server if running, else timestamp fallback; capture = background server only; timestamp = tool stores only, no server")
     discard = commands.add_parser("discard", help="permanently discard one recovery workspace")
     discard.add_argument("workspace")
     discard.add_argument("--yes", action="store_true", help="skip typed confirmation")
@@ -156,6 +156,20 @@ def _status(client: ServiceClient, stdout: TextIO, stderr: TextIO) -> int:
         or bool(response.diagnostics)
     )
     print(f"durability: {'degraded' if degraded else 'healthy'}", file=stdout)
+    # Also show the timestamp (server-less) backend availability, so the user
+    # knows restore works even without the server.
+    try:
+        from termrecall.backends import candidates_from_timestamp, relative_time
+        from pathlib import Path
+        cands = candidates_from_timestamp(Path.home())
+        if cands:
+            top = cands[0]
+            print(f"timestamp backend: {len(cands)} restorable session(s) (no server needed)", file=stdout)
+            print(f"  most recent: {relative_time(top.last_activity)} [{top.tool}] {top.cwd}", file=stdout)
+        else:
+            print("timestamp backend: no sessions found in tool stores", file=stdout)
+    except Exception:
+        pass
     return EXIT_WARNING if degraded else EXIT_OK
 
 
@@ -283,6 +297,35 @@ def _requires_interactive_approval(
     )
 
 
+def _pick_session(matches: list, stdin: TextIO, stdout: TextIO) -> object | None:
+    """Shared multi-session picker used by both the capture and timestamp paths.
+
+    Shows all matching sessions for a cwd (relative time + summary), lets the
+    user pick one (Enter = most-recent, 0 = skip), and returns the chosen
+    SessionRecord, or None to skip.  Eliminates the duplicated picker logic.
+    """
+    if len(matches) <= 1:
+        return matches[0] if matches else None
+    print(f"  {len(matches)} sessions found:", file=stdout)
+    for idx, m in enumerate(matches, 1):
+        label = getattr(m, "summary", "") or getattr(m, "title", "") or getattr(m, "session_id", "")
+        ago = relative_time(getattr(m, "last_activity", ""))
+        span = f"{getattr(m,'first_activity','')[:10]}..{getattr(m,'last_activity','')[:10]}" if getattr(m, "first_activity", "") else ago
+        print(f"    {idx}: {label[:60]}  [{getattr(m,'tool','')}]  {span}", file=stdout)
+    print(f"  Resume session number (1-{len(matches)}, Enter=most-recent, 0=skip): ", end="", file=stdout)
+    answer = _readline(stdin)
+    if answer is None:
+        return None
+    if answer.strip() == "0":
+        return None
+    if answer.strip() == "":
+        return matches[0]
+    try:
+        return matches[int(answer.strip()) - 1]
+    except (ValueError, IndexError):
+        return None
+
+
 def _approvals(items: Sequence[RecoveryItemView], selected: set[str], stdin: TextIO, stdout: TextIO, *, directory_only: bool) -> tuple[str, ...]:
     if directory_only:
         return ()
@@ -304,25 +347,13 @@ def _approvals(items: Sequence[RecoveryItemView], selected: set[str], stdin: Tex
             tool_name = resume_command.split(" ", 1)[0] if resume_command else ""
             matches = [m for m in find_sessions_for_cwd(str(item.directory)) if m.tool == tool_name] if session_count > 1 else []
             if len(matches) > 1:
-                print(f"  {len(matches)} sessions found in {item.directory}:", file=stdout)
-                for idx, m in enumerate(matches, 1):
-                    label = m.summary or m.title or m.session_id
-                    span = f"{m.first_activity[:10]}..{m.last_activity[:10]}" if m.first_activity else "unknown date"
-                    print(f"    {idx}: {label}  [{m.tool}]  {span}", file=stdout)
-                print(f"  Resume session number (1-{len(matches)}, Enter=most-recent, 0=skip): ", end="", file=stdout)
-                answer = _readline(stdin)
-                if answer is None or answer.strip() == "" or answer.strip() == "0":
-                    if answer is not None and answer.strip() == "0":
-                        continue
-                    chosen = matches[0]
+                chosen = _pick_session(matches, stdin, stdout)
+                if chosen is not None:
+                    match = find_resume_adapter(tool)
+                    resume_command = " ".join(build_resume_argv(match, chosen.session_id))
+                    print(f"  resuming: {resume_command}", file=stdout)
                 else:
-                    try:
-                        chosen = matches[int(answer.strip()) - 1]
-                    except (ValueError, IndexError):
-                        continue
-                match = find_resume_adapter(tool)
-                resume_command = " ".join(build_resume_argv(match, chosen.session_id))
-                print(f"  resuming: {resume_command}", file=stdout)
+                    continue  # user typed 0 to skip
             elif summary:
                 print(f"  session: {summary}", file=stdout)
             print(f"Resume this session? [Y/n] ", end="", file=stdout)
@@ -408,27 +439,12 @@ def _restore_from_timestamp(args: argparse.Namespace, stdin: TextIO, stdout: Tex
     selected: list = []
     for num in chosen:
         c = cands[num - 1]
-        # Check for other sessions in the same folder+tool.
+        # If multiple sessions exist in this folder+tool, offer the shared
+        # picker so the user can choose which to resume.
         from termrecall.sessions import find_sessions_for_cwd
         matches = [m for m in find_sessions_for_cwd(c.cwd) if m.tool == c.tool]
-        if len(matches) > 1:
-            print(f"\n{len(matches)} {c.tool} sessions in {c.cwd}:", file=stdout)
-            for mi, m in enumerate(matches, 1):
-                m_ago = relative_time(m.last_activity)
-                m_label = m.summary or m.session_id[:18]
-                print(f"  {mi}: {m_ago:8s}  {m_label[:60]}", file=stdout)
-            print(f"  Resume session number (1-{len(matches)}, Enter=most-recent, 0=skip): ", end="", file=stdout)
-            ans = _readline(stdin)
-            if ans is None or ans.strip() == "" or ans.strip() == "0":
-                if ans is not None and ans.strip() == "0":
-                    continue
-                chosen_session = matches[0]
-            else:
-                try:
-                    chosen_session = matches[int(ans.strip()) - 1]
-                except (ValueError, IndexError):
-                    continue
-            # rebuild resume command with the chosen id
+        chosen_session = _pick_session(matches, stdin, stdout)
+        if chosen_session is not None and chosen_session.session_id != c.session_id:
             from termrecall.adapters.resume import build_resume_argv, find_resume_adapter
             match = find_resume_adapter(c.tool)
             if match is not None:
@@ -437,6 +453,8 @@ def _restore_from_timestamp(args: argparse.Namespace, stdin: TextIO, stdout: Tex
                             last_activity=chosen_session.last_activity,
                             resume_command=" ".join(build_resume_argv(match, chosen_session.session_id)),
                             source=c.source)
+        if chosen_session is None:
+            continue  # user skipped this one
         selected.append(c)
 
     if not selected:
