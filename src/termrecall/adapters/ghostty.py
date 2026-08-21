@@ -14,7 +14,7 @@ from termrecall.adapters.base import (
 )
 from termrecall.model import Outcome, OutcomeKind, RestorationLevel
 
-_GROUPING_WARNING = "grouping unsupported"
+_GHOSTTY_MULTIWINDOW_NOTE = "ghostty: opened in separate windows (no CLI multi-tab)"
 _UNAVAILABLE_WARNING = "terminal executable unavailable"
 DEFAULT_LAUNCH_TIMEOUT = 10.0
 
@@ -49,7 +49,7 @@ class GhosttyAdapter:
             panes=False,
             scrollback=False,
             command_launch=True,
-            deterministic_grouping=True,
+            deterministic_grouping=False,
         )
 
     def plan(self, items: Sequence[LaunchItem]) -> Sequence[LaunchAction]:
@@ -59,33 +59,23 @@ class GhosttyAdapter:
                 LaunchAction((item.item_id,), (), RestorationLevel.UNAVAILABLE, (_UNAVAILABLE_WARNING,))
                 for item in items
             )
-        item_ids: list[str] = []
-        argv: list[str] = [executable]
-        levels: set[RestorationLevel] = set()
-        missing: list[str] = []
-        for index, item in enumerate(items):
+        # ghostty has no multi-tab-from-CLI flag (tabs are window-internal via
+        # keybindings), so restore launches one window per selected item.  Each
+        # window is correct (its cwd + resume command); they just are N windows
+        # instead of 1 window with N tabs.  This is honest, working behavior.
+        actions: list[LaunchAction] = []
+        for item in items:
             if not item.cwd.is_absolute() or not item.cwd.is_dir():
-                missing.append(item.item_id)
+                actions.append(LaunchAction((item.item_id,), (), RestorationLevel.UNAVAILABLE, (f"{item.item_id}: directory unavailable",)))
                 continue
-            argv.append(f"--working-directory={item.cwd}")
+            argv: tuple[str, ...] = (executable, f"--working-directory={item.cwd}")
+            level = RestorationLevel.PARTIAL
             if item.approved_command is not None:
                 argv += ("-e", "bash", "-c", _COMMAND_WRAPPER, "bash", *shlex.split(item.approved_command))
-                levels.add(RestorationLevel.RECONSTRUCTED)
-            else:
-                levels.add(RestorationLevel.PARTIAL)
-            item_ids.append(item.item_id)
-        if not item_ids:
-            return tuple(
-                LaunchAction((iid,), (), RestorationLevel.UNAVAILABLE, (_UNAVAILABLE_WARNING,))
-                for iid in (missing or [i.item_id for i in items])
-            )
-        level = (
-            RestorationLevel.RECONSTRUCTED if RestorationLevel.RECONSTRUCTED in levels
-            else RestorationLevel.PARTIAL if RestorationLevel.PARTIAL in levels
-            else RestorationLevel.UNAVAILABLE
-        )
-        warnings = (_GROUPING_WARNING,) if len(item_ids) > 1 else (() if not missing else tuple(f"{iid}: directory unavailable" for iid in missing))
-        return (LaunchAction(tuple(item_ids), tuple(argv), level, warnings),)
+                level = RestorationLevel.RECONSTRUCTED
+            note = (_GHOSTTY_MULTIWINDOW_NOTE,) if len(items) > 1 else ()
+            actions.append(LaunchAction((item.item_id,), argv, level, note))
+        return tuple(actions)
     def execute(
         self, actions: Sequence[LaunchAction], attempt_id: str
     ) -> Sequence[Outcome]:

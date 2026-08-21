@@ -89,9 +89,11 @@ def test_distinct_commands_grouped_into_single_window(tmp_path: Path) -> None:
             LaunchItem("b", tmp_path, "npm run dev"),
         ]
     )
-    assert len(actions) == 1
-    assert actions[0].item_ids == ("a", "b")
-    assert len(actions[0].item_ids) == 2  # ghostty CLI lacks multi-tab; items still grouped in one action
+    # ghostty has no CLI multi-tab, so restore emits one window per item.
+    assert len(actions) == 2
+    assert actions[0].item_ids == ("a",)
+    assert actions[1].item_ids == ("b",)
+    assert all("separate windows" in w for w in actions[0].warnings)
 
 
 @pytest.mark.parametrize("cwd", [Path("relative"), Path("/definitely/missing/ghostty")])
