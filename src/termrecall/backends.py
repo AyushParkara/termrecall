@@ -111,19 +111,22 @@ def candidates_from_timestamp(home: Path) -> list[RestoreCandidate]:
     candidates: list[RestoreCandidate] = []
     for (tool, cwd), group in by_group.items():
         group.sort(key=lambda r: r.last_activity or "", reverse=True)
-        latest = group[0]
-        candidates.append(RestoreCandidate(
-            item_id=f"{tool}-{latest.session_id[:12]}",
-            tool=tool,
-            session_id=latest.session_id,
-            cwd=cwd,
-            summary=latest.summary,
-            first_activity=latest.first_activity,
-            last_activity=latest.last_activity,
-            resume_command=_resume_command_for(tool, latest.session_id),
-            source="timestamp",
-        ))
-    # Most-recently-active folders first.
+        # Surface EVERY session (not just the most-recent) so multiple tabs in
+        # the same folder all appear — if you had 2 pi tabs in api_scraping,
+        # both show up.  The most-recent is first in its group.
+        for rec in group:
+            candidates.append(RestoreCandidate(
+                item_id=f"{tool}-{rec.session_id[:12]}",
+                tool=tool,
+                session_id=rec.session_id,
+                cwd=cwd,
+                summary=rec.summary,
+                first_activity=rec.first_activity,
+                last_activity=rec.last_activity,
+                resume_command=_resume_command_for(tool, rec.session_id),
+                source="timestamp",
+            ))
+    # Most-recently-active first.
     candidates.sort(key=lambda c: c.last_activity or "", reverse=True)
     return candidates
 

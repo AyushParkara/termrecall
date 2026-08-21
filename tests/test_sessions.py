@@ -304,3 +304,33 @@ def test_summary_empty_when_no_real_prompt(tmp_path: Path) -> None:
     sessions = list_sessions(home=lambda: tmp_path)
     assert sessions[0].summary == ""
     assert sessions[0].record_count == 2
+
+
+# ---------------------------------------------------------------------------
+# pi summary extraction (message.content[].text, nested under "message")
+# ---------------------------------------------------------------------------
+
+def _write_pi_nested_message_session(home: Path, session_id: str, cwd: str, first_msg: str) -> None:
+    """Write a pi-style session where the user turn is nested under
+    record["message"]["role"]=="user" + record["message"]["content"][].text."""
+    slug = "--" + cwd.strip("/").replace("/", "-") + "--"
+    sdir = home / ".pi/agent/sessions" / slug
+    sdir.mkdir(parents=True, exist_ok=True)
+    records = [
+        {"type": "session", "id": session_id, "cwd": cwd, "timestamp": "2026-08-20T10:00:00Z"},
+        {"type": "message", "id": "m1", "timestamp": "2026-08-20T10:01:00Z",
+         "message": {"role": "user", "content": [{"type": "text", "text": first_msg}]}},
+    ]
+    (sdir / f"2026-08-20T10-00-00-000Z_{session_id}.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in records))
+
+
+def test_pi_summary_extracts_nested_message_content(tmp_path: Path) -> None:
+    """pi nests user text under record.message.content[].text; the summary
+    scanner must read it there, not at the top level."""
+    sid = "01a01518-be23-71da-a6c9-df192b278fa6"
+    _write_pi_nested_message_session(tmp_path, sid, "/srv/api", "=== IP: 111.228.37.42 ===")
+    sessions = list_sessions(home=lambda: tmp_path)
+    pi = [r for r in sessions if r.tool == "pi"]
+    assert len(pi) == 1
+    assert pi[0].summary == "=== IP: 111.228.37.42 ==="

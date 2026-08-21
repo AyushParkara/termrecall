@@ -35,13 +35,17 @@ def test_timestamp_backend_discovers_sessions(tmp_path: Path) -> None:
     assert cands[0].source == "timestamp"
 
 
-def test_timestamp_backend_picks_most_recent_per_folder(tmp_path: Path) -> None:
+def test_timestamp_backend_surfaces_all_sessions_per_folder(tmp_path: Path) -> None:
+    # Multiple sessions in the same folder ALL surface (so multiple tabs in one
+    # folder are all restorable), most-recent first.
     _write_codex_rollout(tmp_path, "01a014ef-679a-7e53-9129-decaba38336f", "/srv/app", ts="2026-08-20T09:00:00Z")
     _write_codex_rollout(tmp_path, "01a014f7-934a-7dd2-95fc-5ecfbb2eeafc", "/srv/app", ts="2026-08-20T12:00:00Z")
     cands = candidates_from_timestamp(tmp_path)
-    # One candidate per folder, most-recent selected.
-    assert len(cands) == 1
+    # Both candidates surface (was: only the most-recent).
+    assert len(cands) == 2
+    # Most-recent first.
     assert cands[0].session_id == "01a014f7-934a-7dd2-95fc-5ecfbb2eeafc"
+    assert cands[1].session_id == "01a014ef-679a-7e53-9129-decaba38336f"
 
 
 def test_timestamp_backend_never_crashes_on_missing_store(tmp_path: Path) -> None:

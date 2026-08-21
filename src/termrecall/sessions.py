@@ -359,16 +359,17 @@ def _summarize_session_file(path: Path) -> tuple[str, str, str, int]:
                     last_ts = ts
                 if not summary:
                     payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+                    msg = record.get("message")
                     role = payload.get("role") or record.get("role")
-                    # claude-code marks user turns with type=="user" (no role field).
+                    if role is None and isinstance(msg, dict):
+                        role = msg.get("role")
+                    # claude-code marks user turns with type=="user" (no role field.
                     if role is None and record.get("type") == "user":
                         role = "user"
                     if role == "user":
-                        # Gather text from payload.content (codex) or
-                        # record.message.content (claude).
+                        # Gather text: payload.content (codex) or message.content.
                         text = _extract_text(payload.get("content"))
-                        msg = record.get("message")
-                        if isinstance(msg, dict) and not text:
+                        if not text and isinstance(msg, dict):
                             text = _extract_text(msg.get("content"))
                         # Skip tool-generated context blocks and keep scanning
                         # for the first REAL user prompt.
@@ -434,15 +435,21 @@ def _scan_session_full(path: Path) -> tuple[str | None, str | None, str, str, st
                             if value.startswith("/"):
                                 cwd = value
                                 break
-                # summary (first real user prompt)
+                # summary (first real user prompt).  Tools nest the user turn
+                # differently: codex/claude use payload.role/content; pi uses
+                # record.message.role / record.message.content[].text; opencode
+                # uses type=="user" + message.content.  Check all three shapes.
                 if not summary:
+                    msg = record.get("message")
                     role = payload.get("role") or record.get("role")
+                    if role is None and isinstance(msg, dict):
+                        role = msg.get("role")
                     if role is None and record.get("type") == "user":
                         role = "user"
                     if role == "user":
+                        # Gather text: try payload.content, then message.content.
                         text = _extract_text(payload.get("content"))
-                        msg = record.get("message")
-                        if isinstance(msg, dict) and not text:
+                        if not text and isinstance(msg, dict):
                             text = _extract_text(msg.get("content"))
                         if _is_real_prompt(text):
                             summary = text[:_SUMMARY_MAX_CHARS]
