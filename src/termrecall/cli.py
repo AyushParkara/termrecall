@@ -20,6 +20,7 @@ from typing import TextIO
 
 from termrecall.client import ServiceClient, ServiceUnavailable
 from termrecall.adapters.resume import build_resume_argv, find_resume_adapter
+from termrecall.backends import Backend, candidates_from_timestamp, relative_time, resolve_candidates
 from termrecall.classifier import _parse_one_simple_command
 from termrecall.sessions import find_sessions_for_cwd
 from termrecall.paths import XDGPaths, resolve_paths
@@ -73,9 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--all", action="store_true", help="select every item")
     selection.add_argument("--retry", metavar="ATTEMPT", help="retry an incomplete attempt")
     restore.add_argument("--directory-only", action="store_true", help="never rerun commands")
+    restore.add_argument("--backend", choices=("auto", "capture", "timestamp"), default="auto",
+        help="session source: auto (capture then timestamp fallback), capture (background server), timestamp (tools stores only)")
     discard = commands.add_parser("discard", help="permanently discard one recovery workspace")
     discard.add_argument("workspace")
     discard.add_argument("--yes", action="store_true", help="skip typed confirmation")
+    sessions = commands.add_parser("sessions", help="list restorable agent sessions from tool stores (no server needed)")
+    sessions.add_argument("--tool", help="filter by tool name (e.g. codex, pi)")
+    sessions.add_argument("--cwd", help="only sessions in this directory")
+    sessions.add_argument("--limit", type=int, default=20, help="max sessions to show")
     doctor = commands.add_parser("doctor", help="check local integration and safety")
     doctor.add_argument("--cleanup-stale-socket", action="store_true", help="remove only a lock-verified stale socket")
     setup = commands.add_parser("setup", help="configure installed Bash, autostart, and chooser integrations")
@@ -343,13 +350,138 @@ def _show_result(response: RestoreResultResponse, stdout: TextIO) -> int:
     return EXIT_OK
 
 
+
+
+def _restore_from_timestamp(args: argparse.Namespace, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    """Server-less restore: list timestamp candidates, let the user pick, and
+    launch one terminal window with N tabs (one per selected session), each
+    running that tool resume command in its recorded cwd.
+
+    No background server, no daemon, no capture — just reads the tools own
+    session stores by date, shows relative time + summary, and resumes.
+    """
+    from pathlib import Path
+    from termrecall.backends import candidates_from_timestamp, relative_time
+    from termrecall.adapters.base import LaunchItem
+    import shlex
+    from termrecall.adapters.registry import create_adapter, detect_adapter
+
+    cands = candidates_from_timestamp(Path.home())
+    if not cands:
+        print("no restorable sessions found in any tool store", file=stdout)
+        print("(run codex / pi / hermes / claude at least once; their session files are what termrecall reads)", file=stdout)
+        return EXIT_WARNING
+
+    # Show the candidates with relative time + summary.
+    print(f"{len(cands)} restorable session(s) (timestamp backend, no server):", file=stdout)
+    for idx, c in enumerate(cands, 1):
+        ago = relative_time(c.last_activity)
+        label = c.summary or c.session_id[:18]
+        print(f"  {idx}: {ago:8s}  [{c.tool}]  {c.cwd}", file=stdout)
+        print(f"     resume: {c.resume_command or '(no resume command)'}", file=stdout)
+        if c.summary:
+            print(f"     {label[:70]}", file=stdout)
+
+    # Select which to restore.
+    if getattr(args, "all", False):
+        chosen = list(range(1, len(cands) + 1))
+    else:
+        if not stdin.isatty():
+            print("restore refused: session selection requires an interactive terminal", file=stderr)
+            return EXIT_REFUSED
+        print("Select session numbers (comma-separated), or press Enter to cancel: ", end="", file=stdout)
+        answer = _readline(stdin)
+        if answer is None or not answer.strip():
+            print("restore cancelled", file=stderr)
+            return EXIT_REFUSED
+        try:
+            chosen = [int(x.strip()) for x in answer.split(",")]
+        except ValueError:
+            print("invalid selection", file=stderr)
+            return EXIT_FAILURE
+        if any(i < 1 or i > len(cands) for i in chosen):
+            print("selection out of range", file=stderr)
+            return EXIT_FAILURE
+
+    # For each chosen session, if multiple sessions exist in that cwd, offer
+    # the picker so the user can pick a specific one (not just the default).
+    selected: list = []
+    for num in chosen:
+        c = cands[num - 1]
+        # Check for other sessions in the same folder+tool.
+        from termrecall.sessions import find_sessions_for_cwd
+        matches = [m for m in find_sessions_for_cwd(c.cwd) if m.tool == c.tool]
+        if len(matches) > 1:
+            print(f"\n{len(matches)} {c.tool} sessions in {c.cwd}:", file=stdout)
+            for mi, m in enumerate(matches, 1):
+                m_ago = relative_time(m.last_activity)
+                m_label = m.summary or m.session_id[:18]
+                print(f"  {mi}: {m_ago:8s}  {m_label[:60]}", file=stdout)
+            print(f"  Resume session number (1-{len(matches)}, Enter=most-recent, 0=skip): ", end="", file=stdout)
+            ans = _readline(stdin)
+            if ans is None or ans.strip() == "" or ans.strip() == "0":
+                if ans is not None and ans.strip() == "0":
+                    continue
+                chosen_session = matches[0]
+            else:
+                try:
+                    chosen_session = matches[int(ans.strip()) - 1]
+                except (ValueError, IndexError):
+                    continue
+            # rebuild resume command with the chosen id
+            from termrecall.adapters.resume import build_resume_argv, find_resume_adapter
+            match = find_resume_adapter(c.tool)
+            if match is not None:
+                c = type(c)(item_id=c.item_id, tool=c.tool, session_id=chosen_session.session_id,
+                            cwd=c.cwd, summary=chosen_session.summary, first_activity=chosen_session.first_activity,
+                            last_activity=chosen_session.last_activity,
+                            resume_command=" ".join(build_resume_argv(match, chosen_session.session_id)),
+                            source=c.source)
+        selected.append(c)
+
+    if not selected:
+        print("nothing selected to restore", file=stderr)
+        return EXIT_WARNING
+
+    # Launch: one terminal window with N tabs.
+    adapter_name = detect_adapter() or "gnome-terminal"
+    adapter = create_adapter(adapter_name)
+    if adapter is None:
+        print(f"no supported terminal found (detected {adapter_name})", file=stderr)
+        return EXIT_FAILURE
+    launch_items: list[LaunchItem] = []
+    for c in selected:
+        if not Path(c.cwd).is_dir():
+            print(f"warning: {c.cwd} no longer exists; skipping", file=stderr)
+            continue
+        launch_items.append(LaunchItem(item_id=c.item_id, cwd=Path(c.cwd), approved_command=c.resume_command or None))
+    if not launch_items:
+        print("no restorable items (all cwds missing)", file=stderr)
+        return EXIT_WARNING
+    actions = adapter.plan(tuple(launch_items))
+    print(f"\nrestoring {len(launch_items)} session(s)...", file=stdout)
+    outcomes = adapter.execute(actions, attempt_id=f"timestamp-{int(time.time())}")
+    for outcome in outcomes:
+        kind = outcome.kind.value
+        msg = outcome.message
+        print(f"  {outcome.item_id}: {kind} ({msg})", file=stdout)
+    return EXIT_OK
+
+
 def _restore(args: argparse.Namespace, client: ServiceClient, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    # Timestamp backend is fully server-less (reads the tools' own stores).
+    # auto/capture go through the background server, falling back to the
+    # timestamp candidates only when the server has no workspace to offer.
+    backend = getattr(args, "backend", "auto")
+    if backend == "timestamp":
+        return _restore_from_timestamp(args, stdin, stdout, stderr)
     listed = _list_response(client, stdout, stderr, display=False)
     if listed is None:
         return EXIT_FAILURE
     if listed.workspace_id is None:
-        print("no recovery workspace is available", file=stdout)
-        return EXIT_WARNING
+        # No captured workspace: fall back to the timestamp backend so restore
+        # still works without the background server (graceful degradation).
+        return _restore_from_timestamp(args, stdin, stdout, stderr)
     try:
         if args.retry:
             retry_listed = _list_response(
@@ -400,6 +532,38 @@ def _restore(args: argparse.Namespace, client: ServiceClient, stdin: TextIO, std
     if not isinstance(response, RestoreResultResponse):
         return EXIT_FAILURE
     return _show_result(response, stdout)
+
+
+def _sessions(args: argparse.Namespace, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    """List restorable agent sessions from the tools own stores.
+
+    Needs no background server: reads ~/.codex, ~/.pi, ~/.claude, etc. and
+    shows each session with relative time + summary.  Each layer degrades
+    gracefully: a missing store is skipped, never crashes.
+    """
+    from pathlib import Path
+    cands = candidates_from_timestamp(Path.home())
+    if args.tool:
+        cands = [c for c in cands if c.tool == args.tool]
+    if args.cwd:
+        from pathlib import Path as _P
+        import os
+        target = os.path.normpath(args.cwd)
+        cands = [c for c in cands if os.path.normpath(c.cwd) == target]
+    cands = cands[:args.limit]
+    if not cands:
+        print("no restorable sessions found", file=stdout)
+        return EXIT_WARNING
+    print(f"{len(cands)} restorable session(s) (timestamp backend, no server):", file=stdout)
+    for idx, c in enumerate(cands, 1):
+        ago = relative_time(c.last_activity)
+        label = c.summary or c.session_id
+        print(f"  {idx}: {ago:8s}  [{c.tool}]  {c.cwd}", file=stdout)
+        print(f"     resume: {c.resume_command or '(no resume command)'}", file=stdout)
+        if c.summary:
+            print(f"     {label[:70]}", file=stdout)
+    print("\nUse: termrecall restore --backend timestamp  to restore these", file=stdout)
+    return EXIT_OK
 
 
 def _discard(args: argparse.Namespace, client: ServiceClient, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -836,6 +1000,8 @@ def run(argv: Sequence[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> i
         return EXIT_WARNING if response.workspace_id is None or response.diagnostics else EXIT_OK
     if args.command == "restore":
         return _restore(args, client, stdin, stdout, stderr)
+    if args.command == "sessions":
+        return _sessions(args, stdin, stdout, stderr)
     if args.command == "discard":
         return _discard(args, client, stdin, stdout, stderr)
     return EXIT_FAILURE
